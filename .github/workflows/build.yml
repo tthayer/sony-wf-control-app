@@ -1,0 +1,54 @@
+name: build
+
+# Compile the tool on every push and PR so the SDK submodule + tool sources are
+# verified end-to-end (there is no build step in the dev-owned Light pipeline
+# until Light's own builder runs, so this is our compile gate).
+on:
+  push:
+    branches-ignore: [main]   # main is covered by release.yml
+  pull_request: {}
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  packages: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout (with submodule)
+        uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android platform + build-tools
+        run: sdkmanager "platform-tools" "platforms;android-36" "build-tools;36.0.0"
+
+      - name: Assemble debug APK
+        env:
+          GH_PACKAGES_USER: ${{ github.actor }}
+          GH_PACKAGES_TOKEN: ${{ secrets.GH_PACKAGES_TOKEN || secrets.GITHUB_TOKEN }}
+        run: ./gradlew :tool:assembleDebug --no-daemon --stacktrace
+
+      - name: Run tool unit tests
+        env:
+          GH_PACKAGES_USER: ${{ github.actor }}
+          GH_PACKAGES_TOKEN: ${{ secrets.GH_PACKAGES_TOKEN || secrets.GITHUB_TOKEN }}
+        run: ./gradlew :tool:testDebugUnitTest --no-daemon --stacktrace
+
+      - name: Upload debug APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: sony-wf-debug-apk
+          path: tool/build/outputs/apk/debug/tool-debug.apk
+          if-no-files-found: warn

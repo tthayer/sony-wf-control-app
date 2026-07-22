@@ -1,0 +1,14 @@
+[tool]
+id = "com.thelightphone.sonywf"
+label = "Sony WF"
+versionCode = 1
+versionName = "0.1.0"
+# BLUETOOTH_CONNECT lets the tool enumerate already-paired devices and open an
+# RFCOMM (SPP) socket to the earbuds' Sony service. Pair the earbuds in the
+# system Bluetooth settings first; this tool does not scan/discover, so it does
+# not need BLUETOOTH_SCAN. Brokered entirely by the SDK's LightBluetoothSerial
+# (app code never touches android.bluetooth directly).
+permissions = ["android.permission.BLUETOOTH_CONNECT"]
+# change if you run this on the emulator!
+# serverPackage = "com.thelightphone.sdk.emulator"
+serverPackage = "com.lightos"

@@ -1,0 +1,123 @@
+name: release
+
+# Cut a new release on every merge to main. The version is derived from
+# conventional-commit messages since the last tag (feat -> minor, fix -> patch,
+# feat!/BREAKING CHANGE -> major), seeded at v0.1.0 for the first release.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch: {}
+
+# One release at a time.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+permissions:
+  contents: write   # push the version-bump commit, create the tag + release
+  packages: read    # read the light-keyboard package (transitive dep of :sdk:ui)
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout (submodule + full history for version analysis)
+        uses: actions/checkout@v4
+        with:
+          submodules: true
+          fetch-depth: 0
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android platform + build-tools
+        run: sdkmanager "platform-tools" "platforms;android-36" "build-tools;36.0.0"
+
+      - name: Compute next version (conventional commits)
+        id: version
+        run: |
+          set -euo pipefail
+          latest="$(git tag -l 'v*' | sort -V | tail -n1)"
+          if [ -z "$latest" ]; then
+            next="0.1.0"
+            echo "No existing tags; seeding first release at v${next}."
+          else
+            base="${latest#v}"
+            major="${base%%.*}"; rest="${base#*.}"; minor="${rest%%.*}"; patch="${rest#*.}"
+            log="$(git log --format='%B' "${latest}..HEAD")"
+            bump="patch"
+            if grep -qiE '^BREAKING[ -]CHANGE' <<<"$log" \
+               || grep -qE '^[a-zA-Z]+(\([^)]*\))?!:' <<<"$log"; then
+              bump="major"
+            elif grep -qE '^feat(\([^)]*\))?:' <<<"$log"; then
+              bump="minor"
+            elif grep -qE '^fix(\([^)]*\))?:' <<<"$log"; then
+              bump="patch"
+            fi
+            case "$bump" in
+              major) major=$((major + 1)); minor=0; patch=0 ;;
+              minor) minor=$((minor + 1)); patch=0 ;;
+              patch) patch=$((patch + 1)) ;;
+            esac
+            next="${major}.${minor}.${patch}"
+            echo "Latest ${latest}; commits since imply a ${bump} bump -> v${next}."
+          fi
+          # Monotonic versionCode = number of releases so far + 1.
+          count="$(git tag -l 'v*' | wc -l | tr -d ' ')"
+          {
+            echo "version=${next}"
+            echo "tag=v${next}"
+            echo "versionCode=$((count + 1))"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Sync lighttool.toml to the release version
+        run: |
+          set -euo pipefail
+          toml=tool/lighttool.toml
+          sed -i -E "s/^versionCode = .*/versionCode = ${{ steps.version.outputs.versionCode }}/" "$toml"
+          sed -i -E "s/^versionName = .*/versionName = \"${{ steps.version.outputs.version }}\"/" "$toml"
+          echo "---- $toml ----"; cat "$toml"
+
+      - name: Build signed release APK
+        env:
+          # GitHub Packages (Maven) requires auth even for public packages.
+          # The built-in token reads public packages fine; drop in a
+          # GH_PACKAGES_TOKEN repo secret (read:packages) if that ever changes.
+          GH_PACKAGES_USER: ${{ github.actor }}
+          GH_PACKAGES_TOKEN: ${{ secrets.GH_PACKAGES_TOKEN || secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          ./gradlew :tool:assembleRelease --no-daemon --stacktrace
+          mkdir -p dist
+          cp tool/build/outputs/apk/release/tool-release.apk \
+             "dist/sony-wf-${{ steps.version.outputs.tag }}.apk"
+
+      - name: Commit version bump, tag, and push
+        run: |
+          set -euo pipefail
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          # Pushes authored by GITHUB_TOKEN do not re-trigger workflows; the
+          # [skip ci] marker is a second guard.
+          if ! git diff --quiet -- tool/lighttool.toml; then
+            git add tool/lighttool.toml
+            git commit -m "chore(release): ${{ steps.version.outputs.tag }} [skip ci]"
+            git push origin HEAD:main
+          fi
+          git tag "${{ steps.version.outputs.tag }}"
+          git push origin "${{ steps.version.outputs.tag }}"
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "${{ steps.version.outputs.tag }}" \
+            "dist/sony-wf-${{ steps.version.outputs.tag }}.apk" \
+            --title "${{ steps.version.outputs.tag }}" \
+            --generate-notes
