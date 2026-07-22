@@ -95,7 +95,7 @@ class SonyCommandsAndResponsesTest {
 
     @Test
     fun parseReturnsNullForUnknownPayload() {
-        assertNull(SonyResponses.parse(SonyMessage(SonyFrame.TYPE_COMMAND1, 0, byteArrayOf(0x99, 0x00))))
+        assertNull(SonyResponses.parse(SonyMessage(SonyFrame.TYPE_COMMAND1, 0, byteArrayOf(0x99.toByte(), 0x00))))
         assertNull(SonyResponses.parse(SonyMessage(SonyFrame.TYPE_COMMAND1, 0, ByteArray(0))))
     }
 }
