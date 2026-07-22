@@ -61,12 +61,14 @@ dependencies {
 }
 
 // Unit-test dependencies for the pure-Kotlin Sony protocol library
-// (:tool:testDebugUnitTest). junit / kotlin-test-junit / kotlinx-coroutines-test
-// are not in the version catalog, so they use explicit coordinates;
-// kotlin-test comes from the catalog (libs.kotlin.test).
+// (:tool:testDebugUnitTest). The Light SDK plugin allowlists dependencies by
+// coordinate prefix: `org.jetbrains.kotlin:kotlin-test*` and
+// `org.jetbrains.kotlinx:kotlinx-coroutines*` are allowed, so kotlin-test-junit
+// and kotlinx-coroutines-test pass. We do NOT declare junit:junit directly (it
+// isn't allowlisted); kotlin-test-junit pulls it in transitively, which the
+// plugin's resolved-dependency check permits as a transitive of an allowed dep.
 dependencies {
     testImplementation(libs.kotlin.test)
-    testImplementation("junit:junit:4.13.2")
     testImplementation("org.jetbrains.kotlin:kotlin-test-junit:2.3.20")
     testImplementation("org.jetbrains.kotlinx:kotlinx-coroutines-test:1.10.2")
 }
