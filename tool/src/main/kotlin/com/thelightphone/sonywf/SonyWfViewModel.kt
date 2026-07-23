@@ -71,8 +71,10 @@ class SonyWfViewModel(
         _state.value = SonyUiState.Connecting
         connectJob = viewModelScope.launch {
             try {
+                // Match the WF-1000X family (XM5, and the newer XM6 which speaks
+                // the same serial protocol) by name prefix.
                 val device = bluetooth.pairedDevices()
-                    .firstOrNull { it.name?.contains("WF-1000XM5", ignoreCase = true) == true }
+                    .firstOrNull { it.name?.contains("WF-1000X", ignoreCase = true) == true }
                 if (device == null) {
                     _state.value = SonyUiState.NotPaired
                     return@launch

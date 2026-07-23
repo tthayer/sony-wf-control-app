@@ -60,9 +60,9 @@ class SonyWfHomeScreen(sealedActivity: SealedLightActivity) :
                     contentAlignment = Alignment.Center,
                 ) {
                     when (val s = state) {
-                        is SonyUiState.Connecting -> CenteredMessage("Connecting to WF-1000XM5…")
+                        is SonyUiState.Connecting -> CenteredMessage("Connecting to earbuds…")
                         is SonyUiState.NotPaired -> CenteredMessage(
-                            "No WF-1000XM5 paired.\nPair it in Bluetooth settings, then tap RETRY."
+                            "No WF-1000X earbuds paired.\nPair them in Bluetooth settings, then tap RETRY."
                         )
                         is SonyUiState.Unsupported -> CenteredMessage(
                             "Bluetooth isn't available on this device."
