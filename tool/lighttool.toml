@@ -1,6 +1,6 @@
 [tool]
 id = "com.thelightphone.sonywf"
-label = "Sony WF"
+label = "Sony"
 versionCode = 2
 versionName = "0.1.1"
 # BLUETOOTH_CONNECT lets the tool enumerate already-paired devices and open an
