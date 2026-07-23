@@ -27,6 +27,7 @@ import com.thelightphone.sdk.ui.LightTopBar
 import com.thelightphone.sdk.ui.LightTopBarCenter
 import com.thelightphone.sdk.ui.gridUnitsAsDp
 import com.thelightphone.sonywf.protocol.AncMode
+import com.thelightphone.sonywf.protocol.SonyBattery
 
 @InitialScreen
 class SonyWfHomeScreen(sealedActivity: SealedLightActivity) :
@@ -49,7 +50,7 @@ class SonyWfHomeScreen(sealedActivity: SealedLightActivity) :
                     .background(LightThemeTokens.colors.background),
             ) {
                 LightTopBar(
-                    center = LightTopBarCenter.Text("Sony WF"),
+                    center = LightTopBarCenter.Text(title(state)),
                     modifier = Modifier.padding(bottom = 1f.gridUnitsAsDp()),
                 )
 
@@ -60,9 +61,9 @@ class SonyWfHomeScreen(sealedActivity: SealedLightActivity) :
                     contentAlignment = Alignment.Center,
                 ) {
                     when (val s = state) {
-                        is SonyUiState.Connecting -> CenteredMessage("Connecting to earbuds…")
-                        is SonyUiState.NotPaired -> CenteredMessage(
-                            "No WF-1000X earbuds paired.\nPair them in Bluetooth settings, then tap RETRY."
+                        is SonyUiState.Connecting -> CenteredMessage("Looking for your headphones…")
+                        is SonyUiState.NotFound -> CenteredMessage(
+                            "No Sony headphones found.\nPair them in Bluetooth settings, then tap RETRY."
                         )
                         is SonyUiState.Unsupported -> CenteredMessage(
                             "Bluetooth isn't available on this device."
@@ -77,15 +78,23 @@ class SonyWfHomeScreen(sealedActivity: SealedLightActivity) :
         }
     }
 
+    private fun title(state: SonyUiState): String =
+        (state as? SonyUiState.Connected)?.model ?: "Sony"
+
     private fun bottomBarButtons(state: SonyUiState): List<LightBarButton> =
         when (state) {
-            is SonyUiState.Connected -> buildList {
-                add(LightBarButton.Text(text = "MODE", onClick = viewModel::cycleMode))
-                if (state.mode == AncMode.AMBIENT) {
-                    add(LightBarButton.Text(text = "LEVEL", onClick = viewModel::cycleAmbientLevel))
+            is SonyUiState.Connected ->
+                if (state.ancSupported) {
+                    buildList {
+                        add(LightBarButton.Text(text = "MODE", onClick = viewModel::cycleMode))
+                        if (state.mode == AncMode.AMBIENT) {
+                            add(LightBarButton.Text(text = "LEVEL", onClick = viewModel::cycleAmbientLevel))
+                        }
+                        add(LightBarButton.Text(text = "VOICE", onClick = viewModel::toggleVoice))
+                    }
+                } else {
+                    emptyList() // device has no ANC (e.g. LinkBuds, WF-C500): battery-only view
                 }
-                add(LightBarButton.Text(text = "VOICE", onClick = viewModel::toggleVoice))
-            }
             is SonyUiState.Connecting -> emptyList()
             else -> listOf(
                 LightBarButton.Text(text = "RETRY", onClick = viewModel::retry),
@@ -101,30 +110,40 @@ class SonyWfHomeScreen(sealedActivity: SealedLightActivity) :
             verticalArrangement = Arrangement.spacedBy(0.75f.gridUnitsAsDp(), Alignment.CenterVertically),
             horizontalAlignment = Alignment.CenterHorizontally,
         ) {
-            LightText(
-                text = modeLabel(s.mode),
-                variant = LightTextVariant.Subtitle,
-                align = TextAlign.Center,
-            )
-            if (s.mode == AncMode.AMBIENT) {
+            if (s.ancSupported) {
                 LightText(
-                    text = "Level ${s.ambientLevel} / 20",
+                    text = modeLabel(s.mode),
+                    variant = LightTextVariant.Subtitle,
+                    align = TextAlign.Center,
+                )
+                if (s.mode == AncMode.AMBIENT) {
+                    LightText(
+                        text = "Level ${s.ambientLevel} / 20",
+                        variant = LightTextVariant.Copy,
+                        align = TextAlign.Center,
+                    )
+                }
+                LightText(
+                    text = "Focus on Voice: ${if (s.voicePassthrough) "On" else "Off"}",
                     variant = LightTextVariant.Copy,
+                    lighten = true,
+                    align = TextAlign.Center,
+                )
+            } else {
+                LightText(
+                    text = "Connected",
+                    variant = LightTextVariant.Subtitle,
                     align = TextAlign.Center,
                 )
             }
-            LightText(
-                text = "Focus on Voice: ${if (s.voicePassthrough) "On" else "Off"}",
-                variant = LightTextVariant.Copy,
-                lighten = true,
-                align = TextAlign.Center,
-            )
-            LightText(
-                text = batteryLine(s.leftBattery, s.rightBattery, s.caseBattery),
-                variant = LightTextVariant.Fine,
-                lighten = true,
-                align = TextAlign.Center,
-            )
+            batteryLine(s.battery)?.let {
+                LightText(
+                    text = it,
+                    variant = LightTextVariant.Fine,
+                    lighten = true,
+                    align = TextAlign.Center,
+                )
+            }
         }
     }
 
@@ -134,9 +153,15 @@ class SonyWfHomeScreen(sealedActivity: SealedLightActivity) :
         AncMode.AMBIENT -> "Ambient Sound"
     }
 
-    private fun batteryLine(left: Int?, right: Int?, case: Int?): String {
-        fun pct(v: Int?) = v?.let { "$it%" } ?: "—"
-        return "L ${pct(left)}   R ${pct(right)}   Case ${pct(case)}"
+    /** Adaptive battery line: single level, or L/R (+ Case), depending on what the device reports. */
+    private fun batteryLine(b: SonyBattery): String? {
+        if (b.single != null) return "Battery ${b.single}%"
+        val parts = buildList {
+            b.left?.let { add("L $it%") }
+            b.right?.let { add("R $it%") }
+            b.case?.let { add("Case $it%") }
+        }
+        return if (parts.isEmpty()) null else parts.joinToString("   ")
     }
 
     @Composable

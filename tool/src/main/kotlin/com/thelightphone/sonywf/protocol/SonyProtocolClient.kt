@@ -13,17 +13,20 @@ import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withTimeoutOrNull
 
 /**
- * High-level Sony WF-1000XM5 protocol driver.
+ * High-level Sony headphone protocol driver supporting BOTH wire dialects.
  *
  * Wraps a [LightSerialConnection] (the only `android`-adjacent type this class
  * touches — everything else is pure Kotlin framing/parsing) and:
- *  - runs the Init handshake with retry,
+ *  - runs the Init handshake with retry and DETECTS the dialect (v1/v2) from the
+ *    Init reply length,
+ *  - DISCOVERS device capabilities at runtime (which battery types answer, which
+ *    ANC layout the device uses), so nothing is hardcoded per model,
  *  - manages the alternating sequence number,
  *  - auto-replies with an Ack to every unsolicited Command1/Command2 message,
  *  - sends commands strictly sequentially (one outstanding, awaiting its Ack),
  *  - exposes device state as [StateFlow]s for the UI to observe.
  *
- * @param connection live byte transport to the earbuds.
+ * @param connection live byte transport to the headphones.
  * @param scope scope that owns the inbound collector and auto-Ack writes;
  *   cancelling it (or calling [stop]) tears the driver down.
  */
@@ -32,6 +35,17 @@ class SonyProtocolClient(
     private val scope: CoroutineScope,
 ) {
     // ---- Exposed state -----------------------------------------------------
+
+    private val _connected = MutableStateFlow(false)
+    /** True once the Init handshake completed and the dialect is known. */
+    val connected: StateFlow<Boolean> = _connected.asStateFlow()
+
+    private val _dialect = MutableStateFlow<SonyDialect?>(null)
+    val dialect: StateFlow<SonyDialect?> = _dialect.asStateFlow()
+
+    private val _ancSupported = MutableStateFlow(false)
+    /** True once a valid ANC status reply/notify has been observed. */
+    val ancSupported: StateFlow<Boolean> = _ancSupported.asStateFlow()
 
     private val _ancMode = MutableStateFlow(AncMode.OFF)
     val ancMode: StateFlow<AncMode> = _ancMode.asStateFlow()
@@ -42,17 +56,11 @@ class SonyProtocolClient(
     private val _voicePassthrough = MutableStateFlow(false)
     val voicePassthrough: StateFlow<Boolean> = _voicePassthrough.asStateFlow()
 
-    private val _leftBattery = MutableStateFlow<Int?>(null)
-    /** Left earbud battery percentage, or null until first reported. */
-    val leftBattery: StateFlow<Int?> = _leftBattery.asStateFlow()
+    private val _battery = MutableStateFlow(SonyBattery())
+    val battery: StateFlow<SonyBattery> = _battery.asStateFlow()
 
-    private val _rightBattery = MutableStateFlow<Int?>(null)
-    /** Right earbud battery percentage, or null until first reported. */
-    val rightBattery: StateFlow<Int?> = _rightBattery.asStateFlow()
-
-    private val _caseBattery = MutableStateFlow<Int?>(null)
-    /** Charging-case battery percentage, or null until first reported. */
-    val caseBattery: StateFlow<Int?> = _caseBattery.asStateFlow()
+    private val _firmwareVersion = MutableStateFlow<String?>(null)
+    val firmwareVersion: StateFlow<String?> = _firmwareVersion.asStateFlow()
 
     // ---- Internal state ----------------------------------------------------
 
@@ -67,19 +75,38 @@ class SonyProtocolClient(
     @Volatile
     private var pendingAck: CompletableDeferred<Unit>? = null
 
-    /** Completed by the inbound loop on the very first chunk of any bytes. */
+    /** Completed by the inbound loop when the Init reply (Command1, payload[0]==0x01) arrives. */
     @Volatile
-    private var firstBytes: CompletableDeferred<Unit> = CompletableDeferred()
+    private var pendingInitReply: CompletableDeferred<SonyMessage>? = null
+
+    /** Opcode the inbound loop should match to complete [pendingQuery]. */
+    @Volatile
+    private var pendingQueryOpcode: Int = -1
+
+    /** Completed by the inbound loop when a reply with [pendingQueryOpcode] arrives. */
+    @Volatile
+    private var pendingQuery: CompletableDeferred<SonyMessage>? = null
+
+    /** Discovered ANC layout; null until ANC is discovered (or found unsupported). */
+    @Volatile
+    private var ancSubByte: Int = SonyCommands.V2_ANC_SUB_STANDARD
+
+    @Volatile
+    private var ancWind: Boolean = false
 
     private var receiveJob: Job? = null
 
     // ---- Lifecycle ---------------------------------------------------------
 
     /**
-     * Start collecting inbound bytes and run the Init handshake. Sends the Init
-     * command (Command1 with payload `[0x00, 0x00]`) and resends it every
-     * [INIT_RETRY_MS] up to [INIT_MAX_ATTEMPTS] times until any bytes arrive.
-     * Suspends until bytes arrive or the attempts are exhausted.
+     * Start collecting inbound bytes, run the Init handshake (retrying Init up to
+     * [INIT_MAX_ATTEMPTS] times at [INIT_RETRY_MS] intervals), detect the dialect
+     * from the Init reply length, then discover capabilities: probe every battery
+     * type for the dialect and probe the ANC variant, best-effort fetching the
+     * firmware string. Populates the exposed [StateFlow]s.
+     *
+     * @throws IllegalStateException if no Init reply arrives after the retries
+     *   (callers use this to reject a non-Sony device during connection probing).
      */
     suspend fun start() {
         if (receiveJob == null) {
@@ -88,12 +115,26 @@ class SonyProtocolClient(
             }
         }
 
+        val initReply = CompletableDeferred<SonyMessage>()
+        pendingInitReply = initReply
+        var reply: SonyMessage? = null
         var attempts = 0
-        while (attempts < INIT_MAX_ATTEMPTS && !firstBytes.isCompleted) {
-            connection.write(SonyFrame.encode(SonyFrame.TYPE_COMMAND1, seq, INIT_PAYLOAD))
+        while (attempts < INIT_MAX_ATTEMPTS && reply == null) {
+            connection.write(SonyFrame.encode(SonyFrame.TYPE_COMMAND1, seq, SonyCommands.INIT_PAYLOAD))
             attempts++
-            withTimeoutOrNull(INIT_RETRY_MS) { firstBytes.await() }
+            reply = withTimeoutOrNull(INIT_RETRY_MS) { initReply.await() }
         }
+        pendingInitReply = null
+
+        val detected = reply?.let { SonyResponses.parseInitReplyDialect(it.payload) }
+            ?: throw IllegalStateException("No Sony Init reply after $attempts attempt(s); not a Sony device")
+
+        _dialect.value = detected
+        _connected.value = true
+
+        discoverBattery(detected)
+        discoverAnc(detected)
+        discoverFirmware()
     }
 
     /** Cancel the inbound collector and close the transport. Idempotent. */
@@ -103,29 +144,72 @@ class SonyProtocolClient(
         connection.close()
     }
 
+    // ---- Discovery ---------------------------------------------------------
+
+    /**
+     * Probe each battery type for the dialect sequentially (each awaits its Ack).
+     * Replies are merged into [battery] by the inbound loop as they arrive;
+     * unsupported types are silently ignored by the device and stay null.
+     */
+    private suspend fun discoverBattery(dialect: SonyDialect) {
+        for (type in SonyCommands.batteryTypesFor(dialect)) {
+            sendCommand(SonyFrame.TYPE_COMMAND1, SonyCommands.batteryGet(dialect, type))
+        }
+    }
+
+    /**
+     * Probe the ANC variant. For V2, try the wind sub-byte (0x17) first and fall
+     * back to the standard sub-byte (0x15); for V1, use sub 0x02. The discovered
+     * sub-byte + wind flag drive [setAnc]. [ancSupported] flips true whenever a
+     * valid ANC reply is observed (handled in the inbound loop).
+     */
+    private suspend fun discoverAnc(dialect: SonyDialect) {
+        when (dialect) {
+            SonyDialect.V2 -> {
+                var reply = query(SonyCommands.ancGet(dialect, SonyCommands.V2_ANC_SUB_WIND), SonyResponses.ANC_RET)
+                if (reply != null) {
+                    ancSubByte = SonyCommands.V2_ANC_SUB_WIND
+                    ancWind = reply.payload.size > 7
+                    return
+                }
+                reply = query(SonyCommands.ancGet(dialect, SonyCommands.V2_ANC_SUB_STANDARD), SonyResponses.ANC_RET)
+                if (reply != null) {
+                    ancSubByte = SonyCommands.V2_ANC_SUB_STANDARD
+                    ancWind = false
+                }
+            }
+            SonyDialect.V1 -> {
+                val reply = query(SonyCommands.ancGet(dialect, SonyCommands.V1_ANC_SUB), SonyResponses.ANC_RET)
+                if (reply != null) {
+                    ancSubByte = SonyCommands.V1_ANC_SUB
+                    ancWind = (reply.payload.size > 3 && (reply.payload[3].toInt() and 0xFF) == 0x02)
+                }
+            }
+        }
+    }
+
+    /** Best-effort firmware fetch; ignores absence of a reply. */
+    private suspend fun discoverFirmware() {
+        val reply = query(SonyCommands.firmwareGet(), SonyResponses.FIRMWARE_RET)
+        reply?.let { SonyResponses.parseFirmware(it.payload)?.let { fw -> _firmwareVersion.value = fw } }
+    }
+
     // ---- Commands ----------------------------------------------------------
 
     /**
-     * Set the noise-cancelling mode. [level] applies to [AncMode.AMBIENT] and
-     * is coerced into `0..20`. Sends a committed change (drag=1), waits for the
-     * Ack, then optimistically reflects the request in the exposed state.
+     * Set the noise-cancelling mode using the discovered dialect + ANC layout.
+     * No-op if ANC was not discovered ([ancSupported] is false). [level] applies
+     * to [AncMode.AMBIENT] and is coerced into `0..20`. Waits for the Ack, then
+     * optimistically reflects the request in the exposed state.
      */
     suspend fun setAnc(mode: AncMode, level: Int, voicePassthrough: Boolean) {
-        sendCommand(SonyFrame.TYPE_COMMAND1, SonyCommands.ancSet(mode, level, voicePassthrough))
+        if (!_ancSupported.value) return
+        val dialect = _dialect.value ?: return
+        val payload = SonyCommands.ancSet(dialect, ancSubByte, ancWind, mode, level, voicePassthrough)
+        sendCommand(SonyFrame.TYPE_COMMAND1, payload)
         _ancMode.value = mode
         _ambientLevel.value = level.coerceIn(0, 20)
         _voicePassthrough.value = voicePassthrough
-    }
-
-    /** Request battery status for both earbuds and the case. */
-    suspend fun refreshBattery() {
-        sendCommand(SonyFrame.TYPE_COMMAND1, SonyCommands.getBattery(SonyCommands.BATTERY_TARGET_HEADPHONES))
-        sendCommand(SonyFrame.TYPE_COMMAND1, SonyCommands.getBattery(SonyCommands.BATTERY_TARGET_CASE))
-    }
-
-    /** Request the current ANC/ambient status. */
-    suspend fun refreshAncStatus() {
-        sendCommand(SonyFrame.TYPE_COMMAND1, SonyCommands.getAncStatus())
     }
 
     // ---- Send / receive plumbing ------------------------------------------
@@ -146,8 +230,26 @@ class SonyProtocolClient(
         }
     }
 
+    /**
+     * Send a command (awaiting its Ack) and then await a reply whose opcode is
+     * [replyOpcode], up to [REPLY_TIMEOUT_MS]. Returns the reply message, or null
+     * if none arrived in time. The pending-reply slot is registered BEFORE the
+     * command is written so a fast reply cannot be missed.
+     */
+    private suspend fun query(payload: ByteArray, replyOpcode: Int): SonyMessage? {
+        val deferred = CompletableDeferred<SonyMessage>()
+        pendingQueryOpcode = replyOpcode
+        pendingQuery = deferred
+        return try {
+            sendCommand(SonyFrame.TYPE_COMMAND1, payload)
+            withTimeoutOrNull(REPLY_TIMEOUT_MS) { deferred.await() }
+        } finally {
+            pendingQuery = null
+            pendingQueryOpcode = -1
+        }
+    }
+
     private fun onChunk(chunk: ByteArray) {
-        if (!firstBytes.isCompleted) firstBytes.complete(Unit)
         for (message in decoder.feed(chunk)) handleMessage(message)
     }
 
@@ -163,8 +265,25 @@ class SonyProtocolClient(
             }
 
             SonyFrame.TYPE_COMMAND1, SonyFrame.TYPE_COMMAND2 -> {
-                // A reply or unsolicited notify: update state, then Ack it.
-                SonyResponses.parse(message)?.let { applyEvent(it) }
+                val payload = message.payload
+                val opcode = if (payload.isNotEmpty()) payload[0].toInt() and 0xFF else -1
+
+                if (opcode == SonyResponses.INIT_REPLY_MARKER) {
+                    val d = pendingInitReply
+                    if (d != null && !d.isCompleted) d.complete(message)
+                } else {
+                    _dialect.value?.let { applyEvent(it, message) }
+                }
+
+                // Complete an outstanding reply query, if this matches.
+                if (opcode != -1 && opcode == pendingQueryOpcode) {
+                    val q = pendingQuery
+                    pendingQuery = null
+                    pendingQueryOpcode = -1
+                    q?.complete(message)
+                }
+
+                // Auto-Ack every device Command1/Command2 with seq = (1 - msg.seq).
                 val ackSeq = (1 - message.seq) and 0xFF
                 scope.launch {
                     connection.write(SonyFrame.encode(SonyFrame.TYPE_ACK, ackSeq, EMPTY_PAYLOAD))
@@ -173,23 +292,21 @@ class SonyProtocolClient(
         }
     }
 
-    private fun applyEvent(event: SonyEvent) {
-        when (event) {
+    private fun applyEvent(dialect: SonyDialect, message: SonyMessage) {
+        when (val event = SonyResponses.parse(dialect, message)) {
             is SonyEvent.Anc -> {
+                _ancSupported.value = true
                 _ancMode.value = event.status.mode
                 _ambientLevel.value = event.status.ambientLevel
                 _voicePassthrough.value = event.status.voicePassthrough
             }
             is SonyEvent.Battery -> {
-                val status = event.status
-                when (status.target) {
-                    BatteryTarget.CASE -> status.level?.let { _caseBattery.value = it }
-                    BatteryTarget.HEADPHONES -> {
-                        status.left?.let { _leftBattery.value = it }
-                        status.right?.let { _rightBattery.value = it }
-                    }
-                }
+                _battery.value = _battery.value.mergedWith(event.battery)
             }
+            is SonyEvent.Firmware -> {
+                _firmwareVersion.value = event.version
+            }
+            null -> Unit
         }
     }
 
@@ -197,7 +314,7 @@ class SonyProtocolClient(
         const val INIT_RETRY_MS = 1500L
         const val INIT_MAX_ATTEMPTS = 3
         const val ACK_TIMEOUT_MS = 2000L
-        val INIT_PAYLOAD = byteArrayOf(0x00, 0x00)
+        const val REPLY_TIMEOUT_MS = 1000L
         val EMPTY_PAYLOAD = ByteArray(0)
     }
 }

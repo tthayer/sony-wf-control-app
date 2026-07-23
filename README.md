@@ -1,10 +1,19 @@
 # sony-wf-control-app
 
 A standalone [Light Phone III](https://www.thelightphone.com/) tool that
-controls **Sony WF-1000XM5 / WF-1000XM6** earbuds over Bluetooth —
-noise-cancelling / ambient mode, ambient level, focus-on-voice, and battery
-status — directly from the phone's minimal UI. (The XM6 uses the same serial
-protocol as the XM5, verified against the source project.) **No web interface**: it talks to the earbuds natively
+controls **Sony headphones and earbuds** over Bluetooth — noise-cancelling /
+ambient mode, ambient level, focus-on-voice, and battery status — directly from
+the phone's minimal UI.
+
+It is model-agnostic: it auto-detects the protocol dialect (v1 or v2) from the
+handshake and discovers each device's capabilities at runtime (single vs L/R +
+case battery, ANC variant / wind-noise support), so it adapts to whatever Sony
+device is paired rather than hardcoding a model list. Verified end-to-end on
+**WF-1000XM6** (earbuds) and **WH-1000XM5** (over-ear); other Sony models that
+speak the same serial protocol (WF-1000XM4/XM5, WH-1000XM3/XM4, LinkBuds /
+LinkBuds S, WF-C500/C700N, …) are supported by the same adaptive logic. The
+connected device's name is shown as the title, and controls it doesn't support
+(e.g. ANC on LinkBuds) are hidden. **No web interface**: it talks to the earbuds natively
 over an RFCOMM (SPP-style) serial link, the same "serial control" mechanism
 reverse-engineered by
 [`usering-around/sony-wf1000xm5-controller`](https://github.com/usering-around/sony-wf1000xm5-controller)

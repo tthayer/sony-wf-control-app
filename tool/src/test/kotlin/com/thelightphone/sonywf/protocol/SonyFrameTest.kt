@@ -5,10 +5,6 @@ import kotlin.test.assertContentEquals
 import kotlin.test.assertEquals
 import kotlin.test.assertTrue
 
-/** Parse a space-separated hex string like "3e 0c 00" into a ByteArray. */
-private fun hex(s: String): ByteArray =
-    s.trim().split(Regex("\\s+")).map { it.toInt(16).toByte() }.toByteArray()
-
 private fun ByteArray.toHex(): String = joinToString(" ") { "%02x".format(it) }
 
 class SonyFrameTest {
@@ -27,20 +23,6 @@ class SonyFrameTest {
         // Ack replying to a received seq 1: our seq = (1 - 1) = 0, empty payload.
         val frame = SonyFrame.encode(SonyFrame.TYPE_ACK, 1 - 1, ByteArray(0))
         assertEquals("3e 01 00 00 00 00 00 01 3c", frame.toHex())
-    }
-
-    @Test
-    fun ancSetAmbientPayloadMatchesReferenceVector() {
-        // Ambient, drag=1 (committed set), no voice passthrough, level 15.
-        val payload = SonyCommands.ancSet(AncMode.AMBIENT, level = 15, voicePassthrough = false)
-        assertContentEquals(hex("68 17 01 01 01 00 0f"), payload)
-    }
-
-    @Test
-    fun ancSetAmbientLiveDragPayloadUsesDragZero() {
-        // Research's live-drag example: drag=0, same otherwise.
-        val payload = SonyCommands.ancSet(AncMode.AMBIENT, level = 15, voicePassthrough = false, liveDrag = true)
-        assertContentEquals(hex("68 17 00 01 01 00 0f"), payload)
     }
 
     // ---- Checksum ----------------------------------------------------------

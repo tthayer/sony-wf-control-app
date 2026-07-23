@@ -4,22 +4,119 @@ import com.thelightphone.sdk.bluetooth.LightSerialConnection
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.receiveAsFlow
-import kotlinx.coroutines.launch
 import kotlinx.coroutines.test.advanceUntilIdle
-import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
 import kotlin.test.Test
 import kotlin.test.assertContentEquals
 import kotlin.test.assertEquals
+import kotlin.test.assertFailsWith
+import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
+/** Byte helper that keeps values > 0x7F legal. */
+private fun b(vararg v: Int): ByteArray = ByteArray(v.size) { v[it].toByte() }
+
+/** Decode every client write into the messages the device would see. */
+private fun decodeWrites(writes: List<ByteArray>): List<SonyMessage> =
+    writes.flatMap { SonyFrameDecoder().feed(it) }
+
+/** Find the ANC SET (opcode 0x68) payload the client emitted, or null. */
+private fun ancSetPayload(writes: List<ByteArray>): ByteArray? =
+    decodeWrites(writes)
+        .firstOrNull { it.type == SonyFrame.TYPE_COMMAND1 && it.payload.isNotEmpty() && (it.payload[0].toInt() and 0xFF) == 0x68 }
+        ?.payload
+
 /**
- * A test double for [LightSerialConnection]. `write` records the exact bytes
- * handed to the transport; [deliver] pushes an inbound chunk to the client's
- * `incoming` collector. Backed by an unbounded [Channel] so delivery is
- * independent of subscription timing (deterministic under the test scheduler).
+ * Immutable description of a fake Sony device. The emulator ACKs every command
+ * (with seq = 1 - clientSeq, as a real device does) and replies to the ones it
+ * "supports".
  */
-private class FakeConnection : LightSerialConnection {
+private class EmulatedDevice(
+    val initReplyLen: Int, //                       4 -> V1, 8 -> V2
+    val batteryReplies: Map<Int, ByteArray>, //     type byte -> full battery reply payload
+    val ancSupportedSub: Int?, //                   sub-byte the device answers ANC GET on
+    val ancReplyPayload: ByteArray?, //             0x67 payload sent for the supported sub
+    val firmwarePayload: ByteArray? = null,
+)
+
+/**
+ * A [LightSerialConnection] that emulates an [EmulatedDevice]: it decodes each
+ * client write and pushes the corresponding ACK / reply frames onto `incoming`.
+ * Backed by an unbounded channel so delivery is deterministic under the test
+ * scheduler.
+ */
+private class FakeSonyConnection(private val device: EmulatedDevice) : LightSerialConnection {
+    val writes = mutableListOf<ByteArray>()
+    private val channel = Channel<ByteArray>(Channel.UNLIMITED)
+    override val incoming: Flow<ByteArray> = channel.receiveAsFlow()
+    override var isConnected: Boolean = true
+        private set
+
+    private val decoder = SonyFrameDecoder()
+    private var deviceSeq = 1
+
+    override suspend fun write(bytes: ByteArray) {
+        writes.add(bytes.copyOf())
+        for (msg in decoder.feed(bytes)) respond(msg)
+    }
+
+    override fun close() {
+        isConnected = false
+        channel.close()
+    }
+
+    /** Push a raw inbound frame directly (used to emulate unsolicited notifies). */
+    fun deliver(bytes: ByteArray) {
+        channel.trySend(bytes)
+    }
+
+    private fun send(type: Int, seq: Int, payload: ByteArray) {
+        channel.trySend(SonyFrame.encode(type, seq, payload))
+    }
+
+    /** Device Command1 with a toggling sequence number; the client auto-Acks it. */
+    private fun sendCommand1(payload: ByteArray) {
+        send(SonyFrame.TYPE_COMMAND1, deviceSeq, payload)
+        deviceSeq = 1 - deviceSeq
+    }
+
+    private fun respond(msg: SonyMessage) {
+        // Ignore the client's own ACKs; only react to commands.
+        if (msg.type != SonyFrame.TYPE_COMMAND1 && msg.type != SonyFrame.TYPE_COMMAND2) return
+        val p = msg.payload
+        // Every command is ACKed with seq = (1 - clientSeq).
+        send(SonyFrame.TYPE_ACK, (1 - msg.seq) and 0xFF, ByteArray(0))
+
+        val op = if (p.isNotEmpty()) p[0].toInt() and 0xFF else -1
+        when {
+            // INIT: [0x00, 0x00] -> device sends its Init reply (payload[0]==0x01).
+            op == 0x00 && p.size >= 2 && (p[1].toInt() and 0xFF) == 0x00 -> {
+                sendCommand1(ByteArray(device.initReplyLen).also { it[0] = 0x01 })
+            }
+            // Battery GET (V1 0x10 / V2 0x22).
+            op == SonyCommands.V1_BATTERY_GET || op == SonyCommands.V2_BATTERY_GET -> {
+                val type = if (p.size >= 2) p[1].toInt() and 0xFF else -1
+                device.batteryReplies[type]?.let { sendCommand1(it) }
+            }
+            // ANC GET (0x66): reply only for the sub-byte we support.
+            op == SonyCommands.ANC_GET -> {
+                val sub = if (p.size >= 2) p[1].toInt() and 0xFF else -1
+                if (sub == device.ancSupportedSub && device.ancReplyPayload != null) {
+                    sendCommand1(device.ancReplyPayload)
+                }
+            }
+            // Firmware GET (0x04).
+            op == SonyCommands.FIRMWARE_GET -> {
+                device.firmwarePayload?.let { sendCommand1(it) }
+            }
+            // ANC SET (0x68) and anything else: ACK only, no reply.
+            else -> Unit
+        }
+    }
+}
+
+/** A connection that records writes but never answers — models a non-Sony device. */
+private class SilentConnection : LightSerialConnection {
     val writes = mutableListOf<ByteArray>()
     private val channel = Channel<ByteArray>(Channel.UNLIMITED)
     override val incoming: Flow<ByteArray> = channel.receiveAsFlow()
@@ -34,144 +131,154 @@ private class FakeConnection : LightSerialConnection {
         isConnected = false
         channel.close()
     }
-
-    /** Push an inbound chunk (arbitrary bytes) toward the client. */
-    fun deliver(bytes: ByteArray) {
-        check(channel.trySend(bytes).isSuccess)
-    }
-
-    fun writesHex(i: Int): String = writes[i].joinToString(" ") { "%02x".format(it) }
 }
 
 class SonyProtocolClientTest {
 
+    // (a) v2 WH-1000XM5-style: single battery on 0x00, ANC only on sub 0x15 (7-byte).
     @Test
-    fun handshakeSendsInitAndSetAncEmitsCorrectBytes() = runTest {
-        val conn = FakeConnection()
+    fun v2SingleBatteryDeviceWithStandardAnc() = runTest {
+        val device = EmulatedDevice(
+            initReplyLen = 8, // V2
+            batteryReplies = mapOf(SonyCommands.V2_BATTERY_TYPE_SINGLE to b(0x23, 0x00, 64, 0x00)),
+            ancSupportedSub = SonyCommands.V2_ANC_SUB_STANDARD, // 0x15
+            ancReplyPayload = b(0x67, 0x15, 0x01, 0x01, 0x00, 0x00, 0x00), // 7-byte, ANC mode
+        )
+        val conn = FakeSonyConnection(device)
         val client = SonyProtocolClient(conn, backgroundScope)
 
-        // start(): launches the inbound collector and writes Init.
-        val startJob = launch { client.start() }
-        runCurrent()
-        assertEquals(1, conn.writes.size, "Init should be the first write")
-        assertEquals("3e 0c 00 00 00 00 02 00 00 0e 3c", conn.writesHex(0))
-
-        // Device Acks the Init with seq = (1 - 0) = 1; client adopts seq = 1.
-        conn.deliver(SonyFrame.encode(SonyFrame.TYPE_ACK, 1, ByteArray(0)))
-        runCurrent()
-        startJob.join()
-
-        // setAnc must be sent with the current seq (1) and the Ambient payload.
-        val setJob = launch { client.setAnc(AncMode.AMBIENT, level = 15, voicePassthrough = false) }
-        runCurrent()
-        assertEquals(2, conn.writes.size, "setAnc should produce exactly one more write")
-        val expected = SonyFrame.encode(
-            SonyFrame.TYPE_COMMAND1,
-            1,
-            SonyCommands.ancSet(AncMode.AMBIENT, 15, false),
-        )
-        assertContentEquals(expected, conn.writes[1])
-
-        // Device Acks the command (seq = 1 - 1 = 0); setAnc returns.
-        conn.deliver(SonyFrame.encode(SonyFrame.TYPE_ACK, 0, ByteArray(0)))
-        runCurrent()
-        setJob.join()
-
-        // Optimistic state reflects the request.
-        assertEquals(AncMode.AMBIENT, client.ancMode.value)
-        assertEquals(15, client.ambientLevel.value)
-        assertEquals(false, client.voicePassthrough.value)
-
-        client.stop()
-    }
-
-    @Test
-    fun strictlySequentialSendsWaitForEachAck() = runTest {
-        val conn = FakeConnection()
-        val client = SonyProtocolClient(conn, backgroundScope)
-
-        val startJob = launch { client.start() }
-        runCurrent()
-        conn.deliver(SonyFrame.encode(SonyFrame.TYPE_ACK, 1, ByteArray(0)))
-        runCurrent()
-        startJob.join()
-
-        // refreshBattery issues two commands but must wait for the first Ack
-        // before sending the second.
-        val job = launch { client.refreshBattery() }
-        runCurrent()
-        assertEquals(2, conn.writes.size, "only the first battery command may be in flight")
-        assertContentEquals(
-            SonyFrame.encode(SonyFrame.TYPE_COMMAND1, 1, SonyCommands.getBattery(SonyCommands.BATTERY_TARGET_HEADPHONES)),
-            conn.writes[1],
-        )
-
-        // Ack the first (seq -> 0); the second command goes out with seq 0.
-        conn.deliver(SonyFrame.encode(SonyFrame.TYPE_ACK, 0, ByteArray(0)))
-        runCurrent()
-        assertEquals(3, conn.writes.size)
-        assertContentEquals(
-            SonyFrame.encode(SonyFrame.TYPE_COMMAND1, 0, SonyCommands.getBattery(SonyCommands.BATTERY_TARGET_CASE)),
-            conn.writes[2],
-        )
-
-        conn.deliver(SonyFrame.encode(SonyFrame.TYPE_ACK, 1, ByteArray(0)))
-        runCurrent()
-        job.join()
-
-        client.stop()
-    }
-
-    @Test
-    fun unsolicitedNotifyUpdatesStateAndAutoAcks() = runTest {
-        val conn = FakeConnection()
-        val client = SonyProtocolClient(conn, backgroundScope)
-
-        val startJob = launch { client.start() }
-        runCurrent()
-        conn.deliver(SonyFrame.encode(SonyFrame.TYPE_ACK, 1, ByteArray(0)))
-        runCurrent()
-        startJob.join()
-        val writesAfterHandshake = conn.writes.size
-
-        // Unsolicited battery notify (Command1, seq 1): headphones left=70 right=80.
-        conn.deliver(
-            SonyFrame.encode(SonyFrame.TYPE_COMMAND1, 1, byteArrayOf(0x25, 0x01, 70, 0x00, 80, 0x00)),
-        )
-        runCurrent()
-
-        assertEquals(70, client.leftBattery.value)
-        assertEquals(80, client.rightBattery.value)
-
-        // The client must auto-Ack the notify with seq = (1 - 1) = 0.
-        assertEquals(writesAfterHandshake + 1, conn.writes.size, "notify must be auto-acked")
-        assertContentEquals(
-            SonyFrame.encode(SonyFrame.TYPE_ACK, 0, ByteArray(0)),
-            conn.writes.last(),
-        )
-
-        // A follow-up ANC notify updates ANC state too.
-        conn.deliver(
-            SonyFrame.encode(SonyFrame.TYPE_COMMAND1, 0, byteArrayOf(0x69, 0x17, 0x01, 0x01, 0x00, 0x00, 0x00)),
-        )
-        runCurrent()
-        assertEquals(AncMode.ANC, client.ancMode.value)
-
-        client.stop()
-    }
-
-    @Test
-    fun initRetriesUpToThreeTimesWhenNoBytesArrive() = runTest {
-        val conn = FakeConnection()
-        val client = SonyProtocolClient(conn, backgroundScope)
-
-        // No inbound bytes ever arrive: start() should retry Init 3 times total.
-        val startJob = launch { client.start() }
+        client.start()
         advanceUntilIdle()
-        startJob.join()
 
-        assertEquals(3, conn.writes.size, "Init should be retried up to 3 times")
-        assertTrue(conn.writes.all { it.contentEquals(SonyFrame.encode(SonyFrame.TYPE_COMMAND1, 0, byteArrayOf(0x00, 0x00))) })
+        assertEquals(SonyDialect.V2, client.dialect.value)
+        assertTrue(client.connected.value)
+        assertTrue(client.ancSupported.value)
+        assertEquals(64, client.battery.value.single)
+        assertNull(client.battery.value.left)
+        assertNull(client.battery.value.right)
+        assertNull(client.battery.value.case)
+
+        // setAnc must use the discovered V2 standard (7-byte, sub 0x15) layout.
+        client.setAnc(AncMode.AMBIENT, level = 15, voicePassthrough = false)
+        advanceUntilIdle()
+        assertContentEquals(b(0x68, 0x15, 0x01, 0x01, 0x01, 0x00, 0x0f), ancSetPayload(conn.writes))
+        assertEquals(AncMode.AMBIENT, client.ancMode.value)
+
+        client.stop()
+    }
+
+    // (b) v2 WF earbuds: dual on 0x09 + case on 0x0a, ANC on sub 0x17 (8-byte wind).
+    @Test
+    fun v2DualEarbudsWithWindAnc() = runTest {
+        val device = EmulatedDevice(
+            initReplyLen = 8, // V2
+            batteryReplies = mapOf(
+                SonyCommands.V2_BATTERY_TYPE_DUAL to b(0x23, 0x09, 70, 0x00, 80, 0x00),
+                SonyCommands.V2_BATTERY_TYPE_CASE to b(0x23, 0x0a, 50, 0x01),
+            ),
+            ancSupportedSub = SonyCommands.V2_ANC_SUB_WIND, // 0x17
+            ancReplyPayload = b(0x67, 0x17, 0x01, 0x01, 0x01, 0x02, 0x00, 0x0c), // 8-byte, ambient
+        )
+        val conn = FakeSonyConnection(device)
+        val client = SonyProtocolClient(conn, backgroundScope)
+
+        client.start()
+        advanceUntilIdle()
+
+        assertEquals(SonyDialect.V2, client.dialect.value)
+        assertTrue(client.ancSupported.value)
+        assertEquals(70, client.battery.value.left)
+        assertEquals(80, client.battery.value.right)
+        assertEquals(50, client.battery.value.case)
+        assertNull(client.battery.value.single)
+
+        // setAnc must use the discovered V2 wind (8-byte, sub 0x17) layout.
+        client.setAnc(AncMode.AMBIENT, level = 10, voicePassthrough = false)
+        advanceUntilIdle()
+        assertContentEquals(b(0x68, 0x17, 0x01, 0x01, 0x01, 0x02, 0x00, 0x0a), ancSetPayload(conn.writes))
+
+        client.stop()
+    }
+
+    // (c) v1 device: INIT reply len 4, battery opcode 0x10, ANC sub 0x02 (non-wind).
+    @Test
+    fun v1DeviceUsesV1Layout() = runTest {
+        val device = EmulatedDevice(
+            initReplyLen = 4, // V1
+            batteryReplies = mapOf(
+                SonyCommands.V1_BATTERY_TYPE_DUAL to b(0x11, 0x01, 60, 0x00, 65, 0x00),
+                SonyCommands.V1_BATTERY_TYPE_CASE to b(0x11, 0x02, 45, 0x00),
+            ),
+            ancSupportedSub = SonyCommands.V1_ANC_SUB, // 0x02
+            ancReplyPayload = b(0x67, 0x02, 0x11, 0x00, 0x00, 0x01, 0x00, 0x0f), // non-wind AMBIENT
+        )
+        val conn = FakeSonyConnection(device)
+        val client = SonyProtocolClient(conn, backgroundScope)
+
+        client.start()
+        advanceUntilIdle()
+
+        assertEquals(SonyDialect.V1, client.dialect.value)
+        assertTrue(client.ancSupported.value)
+        assertEquals(60, client.battery.value.left)
+        assertEquals(65, client.battery.value.right)
+        assertEquals(45, client.battery.value.case)
+
+        // Battery GET must have used the V1 opcode 0x10 (not the V2 0x22).
+        val batteryGets = decodeWrites(conn.writes)
+            .filter { it.type == SonyFrame.TYPE_COMMAND1 && it.payload.isNotEmpty() && (it.payload[0].toInt() and 0xFF) == 0x10 }
+        assertTrue(batteryGets.isNotEmpty(), "expected V1 (0x10) battery GETs")
+
+        // setAnc must use the V1 (8-byte, sub 0x02) layout with the inverted byte-4:
+        // ANC -> modeByte 1.
+        client.setAnc(AncMode.ANC, level = 0, voicePassthrough = false)
+        advanceUntilIdle()
+        assertContentEquals(b(0x68, 0x02, 0x11, 0x00, 0x01, 0x01, 0x00, 0x00), ancSetPayload(conn.writes))
+
+        client.stop()
+    }
+
+    // (d) start() throws when no Init reply ever arrives (non-Sony device).
+    @Test
+    fun startThrowsWhenNoInitReply() = runTest {
+        val conn = SilentConnection()
+        val client = SonyProtocolClient(conn, backgroundScope)
+
+        assertFailsWith<IllegalStateException> { client.start() }
+
+        // Init should have been retried up to 3 times, all identical.
+        assertEquals(3, conn.writes.size)
+        val expectedInit = SonyFrame.encode(SonyFrame.TYPE_COMMAND1, 0, SonyCommands.INIT_PAYLOAD)
+        assertTrue(conn.writes.all { it.contentEquals(expectedInit) })
+
+        client.stop()
+    }
+
+    // Unsolicited notifies keep state live and are auto-Acked.
+    @Test
+    fun unsolicitedNotifiesUpdateStateAndAutoAck() = runTest {
+        val device = EmulatedDevice(
+            initReplyLen = 8,
+            batteryReplies = mapOf(SonyCommands.V2_BATTERY_TYPE_SINGLE to b(0x23, 0x00, 64, 0x00)),
+            ancSupportedSub = SonyCommands.V2_ANC_SUB_STANDARD,
+            ancReplyPayload = b(0x67, 0x15, 0x01, 0x01, 0x00, 0x00, 0x00),
+        )
+        val conn = FakeSonyConnection(device)
+        val client = SonyProtocolClient(conn, backgroundScope)
+        client.start()
+        advanceUntilIdle()
+        val writesBefore = conn.writes.size
+
+        // Push an unsolicited battery notify (0x25) case=30 and an ANC notify (0x69) AMBIENT.
+        conn.deliver(SonyFrame.encode(SonyFrame.TYPE_COMMAND1, 1, b(0x25, 0x0a, 30, 0x00)))
+        conn.deliver(SonyFrame.encode(SonyFrame.TYPE_COMMAND1, 0, b(0x69, 0x15, 0x01, 0x01, 0x01, 0x00, 0x08)))
+        advanceUntilIdle()
+
+        assertEquals(30, client.battery.value.case)
+        assertEquals(AncMode.AMBIENT, client.ancMode.value)
+        assertEquals(8, client.ambientLevel.value)
+        // Both notifies were auto-Acked (two extra writes).
+        assertEquals(writesBefore + 2, conn.writes.size)
 
         client.stop()
     }
