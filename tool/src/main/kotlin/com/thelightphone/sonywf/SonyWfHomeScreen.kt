@@ -153,15 +153,21 @@ class SonyWfHomeScreen(sealedActivity: SealedLightActivity) :
         AncMode.AMBIENT -> "Ambient Sound"
     }
 
-    /** Adaptive battery line: single level, or L/R (+ Case), depending on what the device reports. */
+    /**
+     * Adaptive battery line. Prefer the granular per-component view (L / R / Case)
+     * whenever the device reports any of it — earbuds also answer the single-battery
+     * query with an aggregate, which must NOT mask the real per-bud readings. Fall
+     * back to a single reading only for devices that report nothing else (over-ear
+     * like the WH-1000XM5).
+     */
     private fun batteryLine(b: SonyBattery): String? {
-        if (b.single != null) return "Battery ${b.single}%"
         val parts = buildList {
             b.left?.let { add("L $it%") }
             b.right?.let { add("R $it%") }
             b.case?.let { add("Case $it%") }
         }
-        return if (parts.isEmpty()) null else parts.joinToString("   ")
+        if (parts.isNotEmpty()) return parts.joinToString("   ")
+        return b.single?.let { "Battery $it%" }
     }
 
     @Composable
