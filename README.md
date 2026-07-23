@@ -1,9 +1,10 @@
 # sony-wf-control-app
 
 A standalone [Light Phone III](https://www.thelightphone.com/) tool that
-controls **Sony WF-1000XM5** earbuds over Bluetooth — noise-cancelling /
-ambient mode, ambient level, focus-on-voice, and battery status — directly from
-the phone's minimal UI. **No web interface**: it talks to the earbuds natively
+controls **Sony WF-1000XM5 / WF-1000XM6** earbuds over Bluetooth —
+noise-cancelling / ambient mode, ambient level, focus-on-voice, and battery
+status — directly from the phone's minimal UI. (The XM6 uses the same serial
+protocol as the XM5, verified against the source project.) **No web interface**: it talks to the earbuds natively
 over an RFCOMM (SPP-style) serial link, the same "serial control" mechanism
 reverse-engineered by
 [`usering-around/sony-wf1000xm5-controller`](https://github.com/usering-around/sony-wf1000xm5-controller)
@@ -55,6 +56,28 @@ by the SDK, exactly like the YubiKey tool brokers USB/NFC through
 
 > **Pairing:** pair the earbuds once in the system Bluetooth settings. This tool
 > does not scan/discover, so it declares only `BLUETOOTH_CONNECT`.
+
+### Known limitation: the `BLUETOOTH_CONNECT` runtime grant
+
+Verified end-to-end on a real Light Phone III (model TLP301) against WF-1000XM6:
+RFCOMM connect, the Init/ACK handshake, ANC + battery read, and ANC writes all
+work. **But** the shipped LightOS server (`com.lightos`) currently refuses to
+grant `BLUETOOTH_CONNECT` — its permission screen shows **"Not allowed"**
+(`LightSdkPermissionActivity: … BLUETOOTH_CONNECT is not grantable by this
+server`). The SDK-side grant plumbing here is correct (it launches the request
+via `startActivityForResult` so the caller is identified, matching the CAMERA
+path), and `LightSdkServer.androidPermissionAllowed` allows it — but that only
+affects the SDK/emulator build, not the prebuilt on-device `com.lightos`.
+
+So on a production device the permission must be granted one of two ways:
+
+1. **Light adds `BLUETOOTH_CONNECT` to the production server's grantable set**
+   (the real fix for end users — requires a LightOS change).
+2. **Grant it manually over adb** (for development / personal use):
+   ```bash
+   adb shell pm grant com.thelightphone.sonywf android.permission.BLUETOOTH_CONNECT
+   ```
+   After that the tool connects and works fully.
 
 ### SDK extension (submodule branch)
 
