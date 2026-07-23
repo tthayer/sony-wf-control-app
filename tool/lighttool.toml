@@ -1,5 +1,5 @@
 [tool]
-id = "com.thelightphone.sonywf"
+id = "com.thelightphone.sonycontrol"
 label = "Sony"
 versionCode = 2
 versionName = "0.1.1"

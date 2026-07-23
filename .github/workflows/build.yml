@@ -46,6 +46,13 @@ jobs:
           GH_PACKAGES_TOKEN: ${{ secrets.GH_PACKAGES_TOKEN || secrets.GITHUB_TOKEN }}
         run: ./gradlew :tool:testDebugUnitTest --no-daemon --stacktrace
 
+      - name: Dump test result XML on failure
+        if: failure()
+        run: |
+          for f in tool/build/test-results/testDebugUnitTest/*.xml; do
+            echo "==== $f ===="; cat "$f"
+          done
+
       - name: Upload debug APK
         uses: actions/upload-artifact@v4
         with:

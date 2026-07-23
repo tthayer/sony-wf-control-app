@@ -84,7 +84,7 @@ So on a production device the permission must be granted one of two ways:
    (the real fix for end users — requires a LightOS change).
 2. **Grant it manually over adb** (for development / personal use):
    ```bash
-   adb shell pm grant com.thelightphone.sonywf android.permission.BLUETOOTH_CONNECT
+   adb shell pm grant com.thelightphone.sonycontrol android.permission.BLUETOOTH_CONNECT
    ```
    After that the tool connects and works fully.
 
