@@ -94,6 +94,24 @@ class SonyProtocolClient(
     @Volatile
     private var ancWind: Boolean = false
 
+    // ---- Battery accumulation ----------------------------------------------
+    //
+    // Battery replies arrive as separate SINGLE / DUAL / CASE messages that we
+    // fold into one snapshot. The charging case is published ONLY once the
+    // device has also reported a DUAL (per-bud) battery: only earbuds have a
+    // case, and reporting per-bud batteries is the robust, model-agnostic signal
+    // that a case exists. This is order-independent — a CASE reply that arrives
+    // before any DUAL reply is held and surfaces once [dualSeen] flips true; an
+    // over-ear device that never reports dual never shows a case.
+
+    private var battSingle: Int? = null
+    private var battLeft: Int? = null
+    private var battRight: Int? = null
+    private var battCase: Int? = null
+
+    @Volatile
+    private var dualSeen: Boolean = false
+
     private var receiveJob: Job? = null
 
     // ---- Lifecycle ---------------------------------------------------------
@@ -301,7 +319,23 @@ class SonyProtocolClient(
                 _voicePassthrough.value = event.status.voicePassthrough
             }
             is SonyEvent.Battery -> {
-                _battery.value = _battery.value.mergedWith(event.battery)
+                val kind = SonyResponses.batteryReplyKind(dialect, message.payload)
+                val batt = event.battery
+                if (kind != null) {
+                    // Overlay this reply's non-null fields onto the running
+                    // accumulators (never overwrite a known value with null).
+                    batt.single?.let { battSingle = it }
+                    batt.left?.let { battLeft = it }
+                    batt.right?.let { battRight = it }
+                    batt.case?.let { battCase = it }
+                    if (kind == SonyResponses.SonyBatteryKind.DUAL) dualSeen = true
+                    _battery.value = SonyBattery(
+                        single = battSingle,
+                        left = battLeft,
+                        right = battRight,
+                        case = if (dualSeen) battCase else null,
+                    )
+                }
             }
             is SonyEvent.Firmware -> {
                 _firmwareVersion.value = event.version

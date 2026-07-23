@@ -258,9 +258,11 @@ class SonyProtocolClientTest {
     // Unsolicited notifies keep state live and are auto-Acked.
     @Test
     fun unsolicitedNotifiesUpdateStateAndAutoAck() = runTest {
+        // EARBUDS device: it reports a DUAL battery during discovery, so the
+        // case gate (dualSeen) opens and the case notify below is surfaced.
         val device = EmulatedDevice(
             initReplyLen = 8,
-            batteryReplies = mapOf(SonyCommands.V2_BATTERY_TYPE_SINGLE to b(0x23, 0x00, 64, 0x00)),
+            batteryReplies = mapOf(SonyCommands.V2_BATTERY_TYPE_DUAL to b(0x23, 0x09, 55, 0x00, 60, 0x00)),
             ancSupportedSub = SonyCommands.V2_ANC_SUB_STANDARD,
             ancReplyPayload = b(0x67, 0x15, 0x01, 0x01, 0x00, 0x00, 0x00),
         )
@@ -284,6 +286,60 @@ class SonyProtocolClientTest {
         assertEquals(8, client.ambientLevel.value)
         // Both notifies were auto-Acked (two extra writes).
         assertEquals(writesBefore + 2, conn.writes.size)
+
+        client.stop()
+    }
+
+    // Over-ear device (single battery, NO dual): a spurious CASE reply must be
+    // suppressed because the device never reported a per-bud (dual) battery.
+    @Test
+    fun overEarCaseReplyIsSuppressedWithoutDual() = runTest {
+        val device = EmulatedDevice(
+            initReplyLen = 8, // V2
+            batteryReplies = mapOf(
+                SonyCommands.V2_BATTERY_TYPE_SINGLE to b(0x23, 0x00, 64, 0x00),
+                // Spurious case echo from an over-ear device that has no case.
+                SonyCommands.V2_BATTERY_TYPE_CASE to b(0x23, 0x0a, 30, 0x00),
+            ),
+            ancSupportedSub = SonyCommands.V2_ANC_SUB_STANDARD,
+            ancReplyPayload = b(0x67, 0x15, 0x01, 0x01, 0x00, 0x00, 0x00),
+        )
+        val conn = FakeSonyConnection(device)
+        val client = SonyProtocolClient(conn, backgroundScope)
+
+        client.start()
+        advanceUntilIdle()
+
+        assertEquals(64, client.battery.value.single)
+        assertNull(client.battery.value.case) // no dual reported -> case gated off
+        assertNull(client.battery.value.left)
+        assertNull(client.battery.value.right)
+
+        client.stop()
+    }
+
+    // Earbuds device (dual + case): once dual is reported the case surfaces.
+    @Test
+    fun earbudsCaseSurfacesWithDual() = runTest {
+        val device = EmulatedDevice(
+            initReplyLen = 8, // V2
+            batteryReplies = mapOf(
+                SonyCommands.V2_BATTERY_TYPE_DUAL to b(0x23, 0x09, 70, 0x00, 80, 0x00),
+                SonyCommands.V2_BATTERY_TYPE_CASE to b(0x23, 0x0a, 50, 0x01),
+            ),
+            ancSupportedSub = SonyCommands.V2_ANC_SUB_STANDARD,
+            ancReplyPayload = b(0x67, 0x15, 0x01, 0x01, 0x00, 0x00, 0x00),
+        )
+        val conn = FakeSonyConnection(device)
+        val client = SonyProtocolClient(conn, backgroundScope)
+
+        client.start()
+        advanceUntilIdle()
+
+        assertEquals(70, client.battery.value.left)
+        assertEquals(80, client.battery.value.right)
+        assertEquals(50, client.battery.value.case)
+        assertNull(client.battery.value.single)
 
         client.stop()
     }

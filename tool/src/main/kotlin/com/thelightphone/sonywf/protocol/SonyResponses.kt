@@ -94,22 +94,41 @@ object SonyResponses {
 
     // ---- Battery -----------------------------------------------------------
 
-    private enum class BatteryKind { SINGLE, DUAL, CASE }
+    /**
+     * The kind of a battery reply, derived from its type byte (`payload[1]`).
+     * Public so callers (e.g. the client) can distinguish a DUAL reply from a
+     * SINGLE/CASE reply even when both per-bud levels are `0` (and therefore
+     * dropped to null by [parseBattery]). This is the model-agnostic signal that
+     * a device has a charging case: only devices that report per-bud (DUAL)
+     * batteries have one. Note DUAL2 (V2 0x01) maps to [DUAL].
+     */
+    enum class SonyBatteryKind { SINGLE, DUAL, CASE }
 
-    private fun batteryKind(dialect: SonyDialect, type: Int): BatteryKind? = when (dialect) {
+    private fun batteryKind(dialect: SonyDialect, type: Int): SonyBatteryKind? = when (dialect) {
         SonyDialect.V1 -> when (type) {
-            SonyCommands.V1_BATTERY_TYPE_SINGLE -> BatteryKind.SINGLE
-            SonyCommands.V1_BATTERY_TYPE_DUAL -> BatteryKind.DUAL
-            SonyCommands.V1_BATTERY_TYPE_CASE -> BatteryKind.CASE
+            SonyCommands.V1_BATTERY_TYPE_SINGLE -> SonyBatteryKind.SINGLE
+            SonyCommands.V1_BATTERY_TYPE_DUAL -> SonyBatteryKind.DUAL
+            SonyCommands.V1_BATTERY_TYPE_CASE -> SonyBatteryKind.CASE
             else -> null
         }
         SonyDialect.V2 -> when (type) {
-            SonyCommands.V2_BATTERY_TYPE_SINGLE -> BatteryKind.SINGLE // 0x00
-            SonyCommands.V2_BATTERY_TYPE_DUAL2 -> BatteryKind.DUAL //    0x01
-            SonyCommands.V2_BATTERY_TYPE_DUAL -> BatteryKind.DUAL //     0x09
-            SonyCommands.V2_BATTERY_TYPE_CASE -> BatteryKind.CASE //     0x0a
+            SonyCommands.V2_BATTERY_TYPE_SINGLE -> SonyBatteryKind.SINGLE // 0x00
+            SonyCommands.V2_BATTERY_TYPE_DUAL2 -> SonyBatteryKind.DUAL //    0x01
+            SonyCommands.V2_BATTERY_TYPE_DUAL -> SonyBatteryKind.DUAL //     0x09
+            SonyCommands.V2_BATTERY_TYPE_CASE -> SonyBatteryKind.CASE //     0x0a
             else -> null
         }
+    }
+
+    /**
+     * Return the [SonyBatteryKind] of a battery reply/notify payload from its
+     * type byte (`payload[1]`), using the same mapping as [parseBattery]
+     * (DUAL2 -> DUAL). Returns null if the payload is too short (< 2) or the type
+     * is unknown for the dialect.
+     */
+    fun batteryReplyKind(dialect: SonyDialect, payload: ByteArray): SonyBatteryKind? {
+        if (payload.size < 2) return null
+        return batteryKind(dialect, payload[1].toInt() and 0xFF)
     }
 
     /**
@@ -128,15 +147,15 @@ object SonyResponses {
         if (payload.size < 2) return null
         val type = payload[1].toInt() and 0xFF
         return when (batteryKind(dialect, type)) {
-            BatteryKind.SINGLE -> {
+            SonyBatteryKind.SINGLE -> {
                 if (payload.size < 3) return null
                 SonyBattery(single = payload[2].toInt() and 0xFF)
             }
-            BatteryKind.CASE -> {
+            SonyBatteryKind.CASE -> {
                 if (payload.size < 3) return null
                 SonyBattery(case = payload[2].toInt() and 0xFF)
             }
-            BatteryKind.DUAL -> {
+            SonyBatteryKind.DUAL -> {
                 if (payload.size < 5) return null
                 val left = payload[2].toInt() and 0xFF
                 val right = payload[4].toInt() and 0xFF

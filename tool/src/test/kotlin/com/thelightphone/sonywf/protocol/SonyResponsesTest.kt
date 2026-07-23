@@ -92,6 +92,22 @@ class SonyCommandsAndResponsesTest {
     }
 
     @Test
+    fun batteryReplyKindMapsTypeByte() {
+        // V2: 0x00 SINGLE, 0x09 DUAL, 0x01 DUAL (DUAL2 -> DUAL), 0x0a CASE.
+        assertEquals(SonyResponses.SonyBatteryKind.SINGLE, SonyResponses.batteryReplyKind(SonyDialect.V2, bytes(0x23, 0x00, 64, 0x00)))
+        assertEquals(SonyResponses.SonyBatteryKind.DUAL, SonyResponses.batteryReplyKind(SonyDialect.V2, bytes(0x23, 0x09, 70, 0x00, 80, 0x00)))
+        assertEquals(SonyResponses.SonyBatteryKind.DUAL, SonyResponses.batteryReplyKind(SonyDialect.V2, bytes(0x23, 0x01, 55, 0x01, 60, 0x00)))
+        assertEquals(SonyResponses.SonyBatteryKind.CASE, SonyResponses.batteryReplyKind(SonyDialect.V2, bytes(0x23, 0x0a, 90, 0x01)))
+        // V1: 0x00 SINGLE, 0x01 DUAL, 0x02 CASE.
+        assertEquals(SonyResponses.SonyBatteryKind.SINGLE, SonyResponses.batteryReplyKind(SonyDialect.V1, bytes(0x11, 0x00, 42, 0x00)))
+        assertEquals(SonyResponses.SonyBatteryKind.DUAL, SonyResponses.batteryReplyKind(SonyDialect.V1, bytes(0x11, 0x01, 30, 0x00, 40, 0x00)))
+        assertEquals(SonyResponses.SonyBatteryKind.CASE, SonyResponses.batteryReplyKind(SonyDialect.V1, bytes(0x11, 0x02, 77, 0x00)))
+        // Unknown type and too-short payloads -> null.
+        assertNull(SonyResponses.batteryReplyKind(SonyDialect.V2, bytes(0x23, 0x7f, 10, 0)))
+        assertNull(SonyResponses.batteryReplyKind(SonyDialect.V2, bytes(0x23)))
+    }
+
+    @Test
     fun sonyBatteryMergePrefersNewNonNull() {
         val merged = SonyBattery(left = 70).mergedWith(SonyBattery(right = 80)).mergedWith(SonyBattery(case = 50))
         assertEquals(SonyBattery(left = 70, right = 80, case = 50), merged)
