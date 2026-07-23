@@ -5,6 +5,7 @@ import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.receiveAsFlow
 import kotlinx.coroutines.test.advanceUntilIdle
+import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
 import kotlin.test.Test
 import kotlin.test.assertContentEquals
@@ -272,7 +273,11 @@ class SonyProtocolClientTest {
         // Push an unsolicited battery notify (0x25) case=30 and an ANC notify (0x69) AMBIENT.
         conn.deliver(SonyFrame.encode(SonyFrame.TYPE_COMMAND1, 1, b(0x25, 0x0a, 30, 0x00)))
         conn.deliver(SonyFrame.encode(SonyFrame.TYPE_COMMAND1, 0, b(0x69, 0x15, 0x01, 0x01, 0x01, 0x00, 0x08)))
-        advanceUntilIdle()
+        // The inbound collector and the auto-Ack writes run in `backgroundScope`.
+        // With no foreground coroutine pending, `advanceUntilIdle()` returns without
+        // running background-only work, so the delivered notifies would never be
+        // drained; `runCurrent()` runs the background tasks due at this instant.
+        runCurrent()
 
         assertEquals(30, client.battery.value.case)
         assertEquals(AncMode.AMBIENT, client.ancMode.value)
