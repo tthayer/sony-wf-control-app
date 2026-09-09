@@ -83,23 +83,67 @@ class SonyWfHomeScreen(sealedActivity: SealedLightActivity) :
 
     private fun bottomBarButtons(state: SonyUiState): List<LightBarButton> =
         when (state) {
-            is SonyUiState.Connected ->
-                if (state.ancSupported) {
-                    buildList {
-                        add(LightBarButton.Text(text = "MODE", onClick = viewModel::cycleMode))
-                        if (state.mode == AncMode.AMBIENT) {
-                            add(LightBarButton.Text(text = "LEVEL", onClick = viewModel::cycleAmbientLevel))
-                        }
-                        add(LightBarButton.Text(text = "VOICE", onClick = viewModel::toggleVoice))
-                    }
+            is SonyUiState.Connected -> {
+                val update = updateButtons(state.update)
+                if (updateOwnsBar(state.update)) {
+                    update
                 } else {
-                    emptyList() // device has no ANC (e.g. LinkBuds, WF-C500): battery-only view
+                    // LightBottomBar allows at most 3 text items, so UPDATE takes LEVEL's slot.
+                    ancButtons(state, MAX_TEXT_BUTTONS - update.size) + update
                 }
+            }
             is SonyUiState.Connecting -> emptyList()
             else -> listOf(
                 LightBarButton.Text(text = "RETRY", onClick = viewModel::retry),
             )
         }
+
+    /** True once the update flow needs the whole bar to itself. */
+    private fun updateOwnsBar(update: FirmwareUpdateUi): Boolean = when (update) {
+        is FirmwareUpdateUi.Confirming,
+        is FirmwareUpdateUi.Downloading,
+        is FirmwareUpdateUi.Transferring,
+        is FirmwareUpdateUi.Installing,
+        is FirmwareUpdateUi.Completed,
+        is FirmwareUpdateUi.Failed,
+        -> true
+        else -> false
+    }
+
+    private fun updateButtons(update: FirmwareUpdateUi): List<LightBarButton> = when (update) {
+        is FirmwareUpdateUi.Available ->
+            if (update.installable) {
+                listOf(LightBarButton.Text(text = "UPDATE", onClick = viewModel::startUpdate))
+            } else {
+                emptyList() // check-only device: nothing to press
+            }
+        is FirmwareUpdateUi.Confirming -> listOf(
+            LightBarButton.Text(text = "START", onClick = viewModel::confirmUpdate),
+            LightBarButton.Text(text = "BACK", onClick = viewModel::cancelUpdate),
+        )
+        is FirmwareUpdateUi.Downloading,
+        is FirmwareUpdateUi.Transferring,
+        -> listOf(LightBarButton.Text(text = "CANCEL", onClick = viewModel::cancelUpdate))
+        is FirmwareUpdateUi.Installing -> emptyList() // past the point of no return
+        is FirmwareUpdateUi.Completed,
+        is FirmwareUpdateUi.Failed,
+        -> listOf(LightBarButton.Text(text = "OK", onClick = viewModel::dismissUpdateResult))
+        else -> emptyList()
+    }
+
+    /** ANC controls trimmed to [budget] slots; LEVEL is the first to go. */
+    private fun ancButtons(state: SonyUiState.Connected, budget: Int): List<LightBarButton> {
+        if (!state.ancSupported || budget <= 0) return emptyList()
+        return buildList {
+            add(LightBarButton.Text(text = "MODE", onClick = viewModel::cycleMode))
+            if (state.mode == AncMode.AMBIENT && budget >= MAX_TEXT_BUTTONS) {
+                add(LightBarButton.Text(text = "LEVEL", onClick = viewModel::cycleAmbientLevel))
+            }
+            if (size < budget) {
+                add(LightBarButton.Text(text = "VOICE", onClick = viewModel::toggleVoice))
+            }
+        }
+    }
 
     @Composable
     private fun ConnectedBody(s: SonyUiState.Connected) {
@@ -110,7 +154,16 @@ class SonyWfHomeScreen(sealedActivity: SealedLightActivity) :
             verticalArrangement = Arrangement.spacedBy(0.75f.gridUnitsAsDp(), Alignment.CenterVertically),
             horizontalAlignment = Alignment.CenterHorizontally,
         ) {
-            if (s.ancSupported) {
+            // Once the update flow takes over, drop the ANC block: 31 vertical grid
+            // units cannot hold both it and the progress/warning text.
+            val focusedOnUpdate = updateOwnsBar(s.update)
+            if (focusedOnUpdate) {
+                LightText(
+                    text = s.model,
+                    variant = LightTextVariant.Subtitle,
+                    align = TextAlign.Center,
+                )
+            } else if (s.ancSupported) {
                 LightText(
                     text = modeLabel(s.mode),
                     variant = LightTextVariant.Subtitle,
@@ -144,7 +197,56 @@ class SonyWfHomeScreen(sealedActivity: SealedLightActivity) :
                     align = TextAlign.Center,
                 )
             }
+            s.firmwareVersion?.let {
+                LightText(
+                    text = "Firmware $it",
+                    variant = LightTextVariant.Fine,
+                    lighten = true,
+                    align = TextAlign.Center,
+                )
+            }
+            updateLine(s.update)?.let {
+                LightText(
+                    text = it,
+                    variant = LightTextVariant.Copy,
+                    align = TextAlign.Center,
+                )
+            }
+            updateHint(s.update)?.let {
+                LightText(
+                    text = it,
+                    variant = LightTextVariant.Fine,
+                    lighten = true,
+                    align = TextAlign.Center,
+                )
+            }
         }
+    }
+
+    /** One status line for the update flow; null when there is nothing to say. */
+    private fun updateLine(update: FirmwareUpdateUi): String? = when (update) {
+        is FirmwareUpdateUi.Unknown -> null
+        is FirmwareUpdateUi.Checking -> "Checking for updates"
+        is FirmwareUpdateUi.UpToDate -> "Up to date"
+        is FirmwareUpdateUi.Unsupported -> update.reason
+        is FirmwareUpdateUi.Available -> "Firmware ${update.version} available"
+        is FirmwareUpdateUi.Confirming -> "Install firmware ${update.version}?"
+        is FirmwareUpdateUi.Downloading -> "Downloading ${update.percent}%"
+        is FirmwareUpdateUi.Transferring -> "Transferring ${update.percent}%"
+        is FirmwareUpdateUi.Installing -> "Installing… keep the app open"
+        is FirmwareUpdateUi.Completed -> "Update complete"
+        is FirmwareUpdateUi.Failed -> update.message
+    }
+
+    /** Secondary line: the non-installable route, and the pre-install warning. */
+    private fun updateHint(update: FirmwareUpdateUi): String? = when (update) {
+        is FirmwareUpdateUi.Available ->
+            if (update.installable) null else "Install with Sony Sound Connect app"
+        is FirmwareUpdateUi.Confirming ->
+            "Keep the headphones on, near the phone, and this app open.\n" +
+                "Do not use them until the update finishes."
+        is FirmwareUpdateUi.Completed -> "Firmware ${update.version}"
+        else -> null
     }
 
     private fun modeLabel(mode: AncMode): String = when (mode) {
@@ -178,5 +280,10 @@ class SonyWfHomeScreen(sealedActivity: SealedLightActivity) :
             align = TextAlign.Center,
             modifier = Modifier.padding(horizontal = 1.5f.gridUnitsAsDp()),
         )
+    }
+
+    private companion object {
+        /** LightBottomBar refuses more than three text items. */
+        const val MAX_TEXT_BUTTONS = 3
     }
 }

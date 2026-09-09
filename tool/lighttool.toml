@@ -8,7 +8,9 @@ versionName = "0.2.0"
 # system Bluetooth settings first; this tool does not scan/discover, so it does
 # not need BLUETOOTH_SCAN. Brokered entirely by the SDK's LightBluetoothSerial
 # (app code never touches android.bluetooth directly).
-permissions = ["android.permission.BLUETOOTH_CONNECT"]
+# INTERNET is needed only to fetch Sony's firmware feed (info.update.sony.net)
+# and the firmware binary; no other network traffic.
+permissions = ["android.permission.BLUETOOTH_CONNECT", "android.permission.INTERNET"]
 # change if you run this on the emulator!
 # serverPackage = "com.thelightphone.sdk.emulator"
 serverPackage = "com.lightos"

@@ -100,6 +100,26 @@ Upstream Light SDK has no Bluetooth support, so this repo pins its submodule to
 3. A LightOS-server grant so the dangerous runtime `BLUETOOTH_CONNECT`
    permission is actually granted on-device (mirrors how `CAMERA` is handled).
 
+## Firmware updates
+
+The tool checks Sony's firmware feed (`info.update.sony.net`, hence the
+`INTERNET` permission) once per connection, using the category/service IDs the
+headphones report themselves.
+
+- **Tandem-FOTA devices** (the firmware travels over the same RFCOMM link):
+  full check → download → transfer → install, driven from the tool. Tap
+  **UPDATE**, confirm, and keep the headphones on, near the phone, with the app
+  open until it finishes.
+- **MTK/Airoha and "MC app" devices**: check only. The tool reports the
+  available version and tells you to install it with Sony's Sound Connect app.
+- Devices that advertise no update support get no update line.
+
+Specs: [`docs/protocol/fw-update-design.md`](docs/protocol/fw-update-design.md)
+(API contract), [`spec-tandem-fota.md`](docs/protocol/spec-tandem-fota.md)
+(transfer), [`spec-firmware-download.md`](docs/protocol/spec-firmware-download.md)
+(feed discovery/decrypt), [`spec-update-orchestration.md`](docs/protocol/spec-update-orchestration.md)
+(gating).
+
 ## Building locally
 
 Requires JDK 17 and an Android SDK. Provide a GitHub token with `read:packages`
