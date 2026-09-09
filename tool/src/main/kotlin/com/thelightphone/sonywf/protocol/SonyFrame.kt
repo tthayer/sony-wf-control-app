@@ -39,6 +39,13 @@ object SonyFrame {
     const val TYPE_COMMAND2 = 0x0e
 
     /**
+     * Firmware chunks (`UPDT_TRANSFER_DATA`). Ack-required like Command1/2 but
+     * with a longer ack timeout and a smaller resend budget
+     * (spec-tandem-fota §1.2/§1.3: 5000 ms, 2 resends).
+     */
+    const val TYPE_LARGE_DATA_MDR = 0x2c
+
+    /**
      * Encode a single frame: build the pre-escape body (type, seq, big-endian
      * length, payload), append the checksum, then escape the whole body and
      * wrap it with the (never-escaped) header and trailer.
