@@ -16,7 +16,7 @@ sealed interface FirmwareUpdateUi {
     /** Device cannot be updated from here (e.g. no update support at all). */
     data class Unsupported(val reason: String) : FirmwareUpdateUi
 
-    /** [installable] is false for MTK / MC_APP devices: check only, install via Sony's app. */
+    /** [installable] is false for MC_APP devices: check only, install via Sony's app. */
     data class Available(val version: String, val sizeBytes: Long, val installable: Boolean) : FirmwareUpdateUi
 
     data class Confirming(val version: String) : FirmwareUpdateUi
@@ -32,9 +32,9 @@ sealed interface FirmwareUpdateUi {
     data class Failed(val message: String) : FirmwareUpdateUi
 
     /**
-     * Read-only Airoha RACE probe output, one report line per entry. Only
-     * reachable on devices we cannot flash from here (MTK / no update support),
-     * where it is the only way to learn the chip family and frame format.
+     * Read-only Airoha RACE probe output, one report line per entry. Reachable
+     * on Airoha chips and on devices we cannot flash from here, where it is the
+     * only way to learn the chip family and frame format.
      */
     data class Diagnostics(val lines: List<String>) : FirmwareUpdateUi
 }

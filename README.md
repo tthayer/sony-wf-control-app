@@ -110,13 +110,18 @@ headphones report themselves.
   full check → download → transfer → install, driven from the tool. Tap
   **UPDATE**, confirm, and keep the headphones on, near the phone, with the app
   open until it finishes.
-- **MTK/Airoha and "MC app" devices**: check only. The tool reports the
-  available version and tells you to install it with Sony's Sound Connect app.
+- **MTK/Airoha devices** (verified on the WH-1000XM5, chip MT2822): full
+  check → download → transfer → install too, over a second RFCOMM link running
+  the Airoha RACE protocol. The transfer takes 15 to 40 minutes; **DIAG** still
+  runs the read-only chip probe.
+- **"MC app" devices**: check only. The tool reports the available version and
+  tells you to install it with Sony's Sound Connect app.
 - Devices that advertise no update support get no update line.
 
 Specs: [`docs/protocol/fw-update-design.md`](docs/protocol/fw-update-design.md)
 (API contract), [`spec-tandem-fota.md`](docs/protocol/spec-tandem-fota.md)
-(transfer), [`spec-firmware-download.md`](docs/protocol/spec-firmware-download.md)
+(Tandem transfer), [`spec-airoha-mt28xx-single.md`](docs/protocol/spec-airoha-mt28xx-single.md)
+(MTK transfer), [`spec-firmware-download.md`](docs/protocol/spec-firmware-download.md)
 (feed discovery/decrypt), [`spec-update-orchestration.md`](docs/protocol/spec-update-orchestration.md)
 (gating).
 

@@ -489,7 +489,9 @@ class SonyProtocolClientTest {
         assertEquals(setOf(0x30, 0x11), client.supportFunctions.value)
         assertEquals(FirmwareUpdateMethod.TANDEM, client.updateMethod.value)
         assertEquals(
-            UpdateCapability(resumable = true, tws = false, backgroundTransfer = true, acCheck = false),
+            // EnableDisable ENABLE is 0x00: 01 00 01 00 = resumable off, single,
+            // background off, AC check on.
+            UpdateCapability(resumable = false, tws = false, backgroundTransfer = false, acCheck = true),
             client.updateCapability.value,
         )
         assertEquals(

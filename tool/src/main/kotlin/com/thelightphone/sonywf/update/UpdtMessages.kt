@@ -15,6 +15,7 @@ object UpdtMessages {
     const val UPDT_RET_CAPABILITY = 0x31
     const val UPDT_GET_STATUS = 0x32
     const val UPDT_RET_STATUS = 0x33
+    const val UPDT_SET_STATUS = 0x34
     const val UPDT_NTFY_STATUS = 0x35
     const val UPDT_GET_PARAM = 0x36
     const val UPDT_RET_PARAM = 0x37
@@ -29,6 +30,26 @@ object UpdtMessages {
     const val PART2 = 0x11
     const val PART3 = 0x12
     const val PART4 = 0x13
+
+    /** MTK inquired types (spec-tandem-fota §6.4); PART1 (0x10) is Tandem's. */
+    const val INQ_MTK_WO_DISCONNECTION = 0x02
+    const val INQ_MTK_AUTO_UPDATE = 0x04
+    const val INQ_MTK_REPAIR_MODE = 0x05
+    const val INQ_MTK_AC_CONNECTION_CHECK = 0x06
+    const val INQ_USING_MC_APP = 0x07
+
+    /**
+     * v2 `EnableDisable` byte codes. NOTE the polarity: the decompiled enum is
+     * `ENABLE((byte) 0), DISABLE((byte) 1)`
+     * (`com/sony/songpal/tandemfamily/message/mdr/v2/EnableDisable.java:6-8`,
+     * mirrored by KMP's `ProtocolEnableDisable`), i.e. **ENABLE is 0x00**. The
+     * prose in spec-tandem-fota §3.2 claims the opposite; the enum wins.
+     */
+    const val ENABLE = 0x00
+    const val DISABLE = 0x01
+
+    /** `Topology`: 0 = single speaker, 1 = TWS. NOT an EnableDisable. */
+    const val TOPOLOGY_TWS = 0x01
 
     // ---- TandemFotaCommand (payload[2] for PART2/3/4) ---------------------
 
@@ -46,8 +67,19 @@ object UpdtMessages {
     /** `str{n}` cap for the fwVersion / fileName fields (§3.8: the safe choice is 32). */
     const val MAX_STRING_LEN = 32
 
-    /** Fixed number of capability features the device must report (§3.2). */
-    private const val CAPABILITY_FEATURE_COUNT = 4
+    /**
+     * Features per `UPDT_RET_CAPABILITY` layout: the MTK types 0x02/0x04/0x05/
+     * 0x07 carry 3 (`eg0/n.java`), 0x06 carries 4 (`eg0/o.java`) and Tandem
+     * PART1 carries 4 (`eg0/p.java`).
+     */
+    private val CAPABILITY_FEATURES = mapOf(
+        INQ_MTK_WO_DISCONNECTION to 3,
+        INQ_MTK_AUTO_UPDATE to 3,
+        INQ_MTK_REPAIR_MODE to 3,
+        INQ_USING_MC_APP to 3,
+        INQ_MTK_AC_CONNECTION_CHECK to 4,
+        PART1 to 4,
+    )
 
     /** `str{128}` cap for the RET_PARAM string chain (§3.6). */
     private const val PARAM_STRING_LEN = 128
@@ -65,6 +97,14 @@ object UpdtMessages {
     /** `{0x36, inq}` (§3.6). */
     fun getParam(inq: Int): ByteArray =
         byteArrayOf(UPDT_GET_PARAM.toByte(), inq.toByte())
+
+    /**
+     * `{0x34, inq, EnableDisable}` (§3.15, `eg0/b0.java:19-41`) — the MTK path's
+     * "put the device in update mode" switch. Accepted only for MTK inquired
+     * types by the device's own validator.
+     */
+    fun setStatus(inq: Int, enable: Boolean): ByteArray =
+        byteArrayOf(UPDT_SET_STATUS.toByte(), inq.toByte(), (if (enable) ENABLE else DISABLE).toByte())
 
     /** `{0x38, 0x11, command}` — ENTER / EXIT / FINISH / CANCEL (§3.7). */
     fun setSimple(command: Int): ByteArray =
@@ -152,20 +192,33 @@ object UpdtMessages {
     // ---- Parsers ----------------------------------------------------------
 
     /**
-     * `UPDT_RET_CAPABILITY` PART1 (§3.2): exact length 7, `numOfFeature == 4`.
-     * The PART1 sub-address is required — the MTK inquired types answer 0x31
-     * with a different layout.
+     * `UPDT_RET_CAPABILITY`, all three layouts the app accepts (design §10.1):
+     *
+     * ```
+     * MTK 0x02/0x04/0x05/0x07 : 31 inq 03 resumable tws background            (len 6)
+     * MTK 0x06                : 31 inq 04 resumable tws background acCheck    (len 7)
+     * Tandem PART1 0x10       : 31 10  04 resumable topology background acCheck (len 7)
+     * ```
+     *
+     * Length is always `numOfFeature + 3` (`eg0/n,o,p .b()`), and the field
+     * order is fixed by `wv/a.java:284-300` (`V(background, resumable, tws,
+     * acCheck, inq)`): payload[3] resumable, [4] tws/topology, [5] background,
+     * [6] acCheck. Every field except the Tandem topology is an EnableDisable,
+     * so it is true at 0x00 ([ENABLE]); topology is TWS at 0x01.
      */
     fun parseCapability(payload: ByteArray): UpdateCapability? {
-        if (payload.size != 7) return null
+        if (payload.size < 6) return null
         if (u8(payload, 0) != UPDT_RET_CAPABILITY) return null
-        if (u8(payload, 1) != PART1) return null
-        if (u8(payload, 2) != CAPABILITY_FEATURE_COUNT) return null
+        val features = CAPABILITY_FEATURES[u8(payload, 1)] ?: return null
+        if (u8(payload, 2) != features) return null
+        if (payload.size != features + 3) return null
+        val topologyByte = u8(payload, 4)
         return UpdateCapability(
-            resumable = u8(payload, 3) == 0x01,
-            tws = u8(payload, 4) == 0x01,
-            backgroundTransfer = u8(payload, 5) == 0x01,
-            acCheck = u8(payload, 6) == 0x01,
+            resumable = u8(payload, 3) == ENABLE,
+            // PART1 carries a Topology here, the MTK layouts an EnableDisable.
+            tws = if (u8(payload, 1) == PART1) topologyByte == TOPOLOGY_TWS else topologyByte == ENABLE,
+            backgroundTransfer = u8(payload, 5) == ENABLE,
+            acCheck = features == 4 && u8(payload, 6) == ENABLE,
         )
     }
 

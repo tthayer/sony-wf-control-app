@@ -85,6 +85,10 @@ class RaceClient(
      * On timeout the IDENTICAL frame is resent up to [retries] times. Returns
      * null when nothing matched. Serialised by a [Mutex] so a stray reply
      * cannot be attributed to the wrong request.
+     *
+     * [replyFlagMask] additionally requires those flag bits on the reply: once
+     * a FOTA session is open the device sets 0x10 and frames without it are
+     * noise (spec-airoha-mt28xx-single §0.1).
      */
     suspend fun request(
         raceId: Int,
@@ -93,16 +97,37 @@ class RaceClient(
         timeoutMs: Long = DEFAULT_TIMEOUT_MS,
         retries: Int = DEFAULT_RETRIES,
         acceptTypes: Set<Int> = setOf(RaceFrame.TYPE_RSP, RaceFrame.TYPE_NOTIFY),
+        replyFlagMask: Int = 0,
     ): RaceMessage? = sendMutex.withLock {
         // Encode once so every resend is byte-identical.
         val frame = RaceFrame.encode(flag, RaceFrame.TYPE_CMD, raceId, payload)
         var attempt = 0
         while (attempt <= retries) {
-            val reply = attempt(frame, raceId, acceptTypes, timeoutMs)
+            val reply = attempt(frame, raceId, acceptTypes, timeoutMs, replyFlagMask)
             if (reply != null) return@withLock reply
             attempt++
         }
         null
+    }
+
+    /**
+     * Write pre-encoded frame bytes with no reply matching. The long-packet
+     * writer concatenates several complete RACE frames into ONE write and
+     * matches the acks itself off [messages] (spec §6.5), which the
+     * one-in-flight [request] path cannot express.
+     *
+     * Takes [sendMutex] so it cannot interleave with a [request]. Returns false
+     * when the transport write failed.
+     */
+    suspend fun writeRaw(bytes: ByteArray): Boolean = sendMutex.withLock {
+        try {
+            connection.write(bytes)
+            true
+        } catch (e: CancellationException) {
+            throw e
+        } catch (_: Exception) {
+            false
+        }
     }
 
     /** Cancel the inbound collector and close the transport. Idempotent. */
@@ -123,12 +148,16 @@ class RaceClient(
         raceId: Int,
         acceptTypes: Set<Int>,
         timeoutMs: Long,
+        replyFlagMask: Int,
     ): RaceMessage? = coroutineScope {
         // UNDISPATCHED runs the body until its first real suspension, which is
         // inside SharedFlow.collect AFTER the subscriber slot is registered.
         val awaiting = async(start = CoroutineStart.UNDISPATCHED) {
             withTimeoutOrNull(timeoutMs) {
-                messages.first { it.raceId == raceId && it.type in acceptTypes }
+                messages.first {
+                    it.raceId == raceId && it.type in acceptTypes &&
+                        (it.flag and replyFlagMask) == replyFlagMask
+                }
             }
         }
         val written = try {

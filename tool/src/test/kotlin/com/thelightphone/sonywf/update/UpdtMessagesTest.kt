@@ -139,23 +139,56 @@ class UpdtMessagesTest {
     // ---- Capability --------------------------------------------------------
 
     @Test
-    fun parseCapabilityReadsAllFourFlags() {
+    fun parseCapabilityReadsAllFourTandemFlags() {
+        // EnableDisable is ENABLE=0x00 / DISABLE=0x01; Topology is TWS=0x01.
         assertEquals(
-            UpdateCapability(resumable = true, tws = true, backgroundTransfer = false, acCheck = true),
-            UpdtMessages.parseCapability(bytes(0x31, 0x10, 0x04, 0x01, 0x01, 0x00, 0x01)),
+            UpdateCapability(resumable = true, tws = true, backgroundTransfer = true, acCheck = true),
+            UpdtMessages.parseCapability(bytes(0x31, 0x10, 0x04, 0x00, 0x01, 0x00, 0x00)),
         )
         assertEquals(
             UpdateCapability(resumable = false, tws = false, backgroundTransfer = false, acCheck = false),
-            UpdtMessages.parseCapability(bytes(0x31, 0x10, 0x04, 0x00, 0x00, 0x00, 0x00)),
+            UpdtMessages.parseCapability(bytes(0x31, 0x10, 0x04, 0x01, 0x00, 0x01, 0x01)),
+        )
+    }
+
+    @Test
+    fun parseCapabilityReadsTheThreeFieldMtkLayout() {
+        for (inq in intArrayOf(0x02, 0x04, 0x05, 0x07)) {
+            assertEquals(
+                UpdateCapability(resumable = true, tws = false, backgroundTransfer = true, acCheck = false),
+                UpdtMessages.parseCapability(bytes(0x31, inq, 0x03, 0x00, 0x01, 0x00)),
+                "inq 0x%02x".format(inq),
+            )
+        }
+        // A single (non-TWS) MT2822 headphone: tws must read false.
+        assertEquals(
+            UpdateCapability(resumable = false, tws = false, backgroundTransfer = false, acCheck = false),
+            UpdtMessages.parseCapability(bytes(0x31, 0x04, 0x03, 0x01, 0x01, 0x01)),
+        )
+    }
+
+    @Test
+    fun parseCapabilityReadsTheAcCheckMtkLayout() {
+        assertEquals(
+            UpdateCapability(resumable = true, tws = true, backgroundTransfer = false, acCheck = true),
+            UpdtMessages.parseCapability(bytes(0x31, 0x06, 0x04, 0x00, 0x00, 0x01, 0x00)),
         )
     }
 
     @Test
     fun parseCapabilityRejectsMalformed() {
-        assertNull(UpdtMessages.parseCapability(bytes(0x31, 0x10, 0x04, 0x01, 0x01, 0x00))) //      len 6
-        assertNull(UpdtMessages.parseCapability(bytes(0x31, 0x10, 0x03, 0x01, 0x01, 0x00, 0x01))) // numOfFeature != 4
-        assertNull(UpdtMessages.parseCapability(bytes(0x31, 0x02, 0x04, 0x01, 0x01, 0x00, 0x01))) // MTK sub-address
-        assertNull(UpdtMessages.parseCapability(bytes(0x37, 0x10, 0x04, 0x01, 0x01, 0x00, 0x01))) // wrong opcode
+        assertNull(UpdtMessages.parseCapability(bytes(0x31, 0x10, 0x04, 0x00, 0x01, 0x00))) //       PART1 len 6
+        assertNull(UpdtMessages.parseCapability(bytes(0x31, 0x10, 0x03, 0x00, 0x01, 0x00))) //       PART1 wants 4
+        assertNull(UpdtMessages.parseCapability(bytes(0x31, 0x02, 0x04, 0x00, 0x01, 0x00, 0x00))) // 0x02 wants 3
+        assertNull(UpdtMessages.parseCapability(bytes(0x31, 0x06, 0x03, 0x00, 0x01, 0x00))) //       0x06 wants 4
+        assertNull(UpdtMessages.parseCapability(bytes(0x31, 0x11, 0x03, 0x00, 0x01, 0x00))) //       unknown inq
+        assertNull(UpdtMessages.parseCapability(bytes(0x37, 0x10, 0x04, 0x00, 0x01, 0x00, 0x00))) // wrong opcode
+    }
+
+    @Test
+    fun setStatusEncodesTheMtkUpdateModeSwitch() {
+        assertContentEquals(bytes(0x34, 0x04, 0x00), UpdtMessages.setStatus(0x04, enable = true))
+        assertContentEquals(bytes(0x34, 0x04, 0x01), UpdtMessages.setStatus(0x04, enable = false))
     }
 
     // ---- Params ------------------------------------------------------------

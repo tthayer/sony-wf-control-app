@@ -11,10 +11,13 @@ import com.thelightphone.sonywf.protocol.AncMode
 import com.thelightphone.sonywf.protocol.SonyBattery
 import com.thelightphone.sonywf.protocol.SonyProtocolClient
 import com.thelightphone.sonywf.update.AvailableUpdate
+import com.thelightphone.sonywf.update.FirmwareImage
 import com.thelightphone.sonywf.update.FirmwareUpdateChecker
 import com.thelightphone.sonywf.update.FirmwareUpdateMethod
+import com.thelightphone.sonywf.update.FirmwareUpdateMethods
 import com.thelightphone.sonywf.update.FotaFailure
 import com.thelightphone.sonywf.update.FotaPhase
+import com.thelightphone.sonywf.update.MtkUpdateController
 import com.thelightphone.sonywf.update.TandemFotaSession
 import com.thelightphone.sonywf.update.UpdateCheck
 import com.thelightphone.sonywf.update.UpdateParams
@@ -22,6 +25,7 @@ import com.thelightphone.sonywf.update.airoha.AirohaDiagnostics
 import com.thelightphone.sonywf.update.airoha.RaceClient
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -47,6 +51,8 @@ sealed interface SonyUiState {
      * to a model, since the protocol has no model query). [ancSupported] gates the
      * ANC controls; [battery] carries whatever the device actually reports.
      * [firmwareVersion] is null until the device answers the firmware query.
+     * [updateMethod] is null until discovered; the screen keys the update copy
+     * and the DIAG affordance off it, since MTK and Tandem installs differ.
      */
     data class Connected(
         val model: String,
@@ -56,6 +62,7 @@ sealed interface SonyUiState {
         val voicePassthrough: Boolean,
         val battery: SonyBattery,
         val firmwareVersion: String?,
+        val updateMethod: FirmwareUpdateMethod?,
         val update: FirmwareUpdateUi,
     ) : SonyUiState
 
@@ -103,6 +110,7 @@ class SonyWfViewModel(
     private var pendingUpdate: AvailableUpdate? = null
     private var pendingInstallable: Boolean = false
     private var fotaSession: TandemFotaSession? = null
+    private var mtkController: MtkUpdateController? = null
 
     /** Update state the DIAG report covered up, so OK can put it straight back. */
     private var preDiagnostics: FirmwareUpdateUi? = null
@@ -194,12 +202,18 @@ class SonyWfViewModel(
                 voicePassthrough = voice,
                 battery = battery,
                 firmwareVersion = null,
+                updateMethod = null,
                 update = FirmwareUpdateUi.Unknown,
             )
         }
         mirrorJob = viewModelScope.launch {
-            combine(core, protocol.firmwareVersion, _update) { base, firmware, update ->
-                base.copy(firmwareVersion = firmware, update = update)
+            combine(
+                core,
+                protocol.firmwareVersion,
+                protocol.updateMethod,
+                _update,
+            ) { base, firmware, method, update ->
+                base.copy(firmwareVersion = firmware, updateMethod = method, update = update)
             }.collect { _state.value = it }
         }
     }
@@ -252,8 +266,10 @@ class SonyWfViewModel(
                 is UpdateCheck.UpToDate -> FirmwareUpdateUi.UpToDate
                 is UpdateCheck.Error -> FirmwareUpdateUi.Failed(result.message)
                 is UpdateCheck.Available -> {
-                    // Only Tandem FOTA can be driven from here; MTK/MC_APP is check-only.
-                    val installable = inputs.method == FirmwareUpdateMethod.TANDEM
+                    // Tandem over MDR and MTK over Airoha RACE can both be driven
+                    // from here; MC_APP has no transport of ours, so it stays check-only.
+                    val installable = inputs.method == FirmwareUpdateMethod.TANDEM ||
+                        inputs.method == FirmwareUpdateMethod.MTK
                     pendingUpdate = result.update
                     pendingInstallable = installable
                     FirmwareUpdateUi.Available(result.update.version, result.update.sizeBytes, installable)
@@ -304,21 +320,75 @@ class SonyWfViewModel(
                 publishTerminal(FirmwareUpdateUi.Failed(e.message ?: "Download failed"))
                 return@launch
             }
-            val session = TandemFotaSession(protocol, reconnect = { reconnectForUpdate() })
-            fotaSession = session
-            val phaseMirror = launch {
-                session.phase.collect { _update.value = phaseToUi(it, available) }
+            val terminal = when (protocol.updateMethod.value) {
+                FirmwareUpdateMethod.TANDEM -> runTandemUpdate(protocol, image, available)
+                FirmwareUpdateMethod.MTK -> runMtkUpdate(protocol, image, available)
+                else -> FotaPhase.Failed(FotaFailure.OTHER, "no install path for this device")
             }
-            val terminal = try {
-                session.run(image)
-            } catch (e: CancellationException) {
-                throw e
-            } catch (e: Exception) {
-                FotaPhase.Failed(FotaFailure.OTHER, e.message ?: "Update failed")
-            }
+            publishTerminal(phaseToUi(terminal, available))
+        }
+    }
+
+    /** Firmware inside the MDR link (spec-tandem-fota). */
+    private suspend fun runTandemUpdate(
+        protocol: SonyProtocolClient,
+        image: FirmwareImage,
+        available: AvailableUpdate,
+    ): FotaPhase = coroutineScope {
+        val session = TandemFotaSession(protocol, reconnect = { reconnectForUpdate() })
+        fotaSession = session
+        val phaseMirror = launch {
+            session.phase.collect { _update.value = phaseToUi(it, available) }
+        }
+        try {
+            session.run(image)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            FotaPhase.Failed(FotaFailure.OTHER, e.message ?: "Update failed")
+        } finally {
             phaseMirror.cancel()
             fotaSession = null
-            publishTerminal(phaseToUi(terminal, available))
+        }
+    }
+
+    /**
+     * Firmware over the Airoha RACE socket (docs/protocol/fw-update-design.md §10):
+     * a second, separate RFCOMM link, while the MDR link stays up to arm and
+     * disarm the update mode.
+     */
+    private suspend fun runMtkUpdate(
+        protocol: SonyProtocolClient,
+        image: FirmwareImage,
+        available: AvailableUpdate,
+    ): FotaPhase = coroutineScope {
+        val inquiredType =
+            FirmwareUpdateMethods.updtInquiredType(protocol.supportFunctions.value ?: emptySet())
+                ?: return@coroutineScope FotaPhase.Failed(
+                    FotaFailure.OTHER,
+                    "no update inquired type",
+                )
+        val address = deviceAddress
+            ?: return@coroutineScope FotaPhase.Failed(FotaFailure.OTHER, "device address unknown")
+        val controller = MtkUpdateController(
+            protocol,
+            openAiroha = { bluetooth.connect(address, UUID.fromString(AirohaDiagnostics.SPP_UUID)) },
+            reconnect = { reconnectForUpdate() },
+            scope = viewModelScope,
+        )
+        mtkController = controller
+        val phaseMirror = launch {
+            controller.phase.collect { _update.value = phaseToUi(it, available) }
+        }
+        try {
+            controller.run(image, inquiredType, protocol.updateCapability.value)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            FotaPhase.Failed(FotaFailure.OTHER, e.message ?: "Update failed")
+        } finally {
+            phaseMirror.cancel()
+            mtkController = null
         }
     }
 
@@ -369,16 +439,24 @@ class SonyWfViewModel(
     /**
      * DIAG: one read-only Airoha RACE probe (docs/protocol/spec-airoha-fota.md
      * §2, §3.7) on a SEPARATE secure RFCOMM socket, so nothing here touches the
-     * live Sony MDR link. Only offered where we cannot flash from here anyway:
-     * a check-only [FirmwareUpdateUi.Available] or [FirmwareUpdateUi.Unsupported].
+     * live Sony MDR link. Offered on Airoha chips (MTK, which the MTK install
+     * path uses anyway) and where we cannot flash from here at all: a check-only
+     * [FirmwareUpdateUi.Available] or [FirmwareUpdateUi.Unsupported].
      *
      * Every line is logged as well as shown: the report is the point of the run,
      * and logcat survives the screen going away.
      */
     fun runAirohaDiagnostics() {
+        // A second socket mid-update would fight the transfer for the radio.
+        if (updateInProgress()) return
+        val method = client?.updateMethod?.value
         val current = _update.value
-        val eligible = (current is FirmwareUpdateUi.Available && !current.installable) ||
-            current is FirmwareUpdateUi.Unsupported
+        val eligible = when (current) {
+            is FirmwareUpdateUi.Available ->
+                !current.installable || method == FirmwareUpdateMethod.MTK
+            is FirmwareUpdateUi.Unsupported -> true
+            else -> false
+        }
         if (!eligible) return
         if (diagJob?.isActive == true) return
         val address = deviceAddress ?: return
@@ -433,8 +511,13 @@ class SonyWfViewModel(
             }
             // The device must be told, otherwise it stays in FW-update mode.
             is FirmwareUpdateUi.Transferring -> {
-                val session = fotaSession ?: return
-                viewModelScope.launch { runCatching { session.cancel() } }
+                val session = fotaSession
+                val mtk = mtkController
+                if (session == null && mtk == null) return
+                viewModelScope.launch {
+                    runCatching { session?.cancel() }
+                    runCatching { mtk?.cancel() }
+                }
             }
             else -> Unit
         }
@@ -557,6 +640,7 @@ class SonyWfViewModel(
         updateJob?.cancel(); updateJob = null
         diagJob?.cancel(); diagJob = null
         fotaSession = null
+        mtkController = null
         preDiagnostics = null
         pendingUpdate = null
         pendingInstallable = false

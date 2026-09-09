@@ -29,6 +29,7 @@ import com.thelightphone.sdk.ui.LightTopBarCenter
 import com.thelightphone.sdk.ui.gridUnitsAsDp
 import com.thelightphone.sonywf.protocol.AncMode
 import com.thelightphone.sonywf.protocol.SonyBattery
+import com.thelightphone.sonywf.update.FirmwareUpdateMethod
 
 @InitialScreen
 class SonyWfHomeScreen(sealedActivity: SealedLightActivity) :
@@ -85,7 +86,7 @@ class SonyWfHomeScreen(sealedActivity: SealedLightActivity) :
     private fun bottomBarButtons(state: SonyUiState): List<LightBarButton> =
         when (state) {
             is SonyUiState.Connected -> {
-                val update = updateButtons(state.update)
+                val update = updateButtons(state.update, state.updateMethod)
                 if (updateOwnsBar(state.update)) {
                     update
                 } else {
@@ -112,14 +113,20 @@ class SonyWfHomeScreen(sealedActivity: SealedLightActivity) :
         else -> false
     }
 
-    private fun updateButtons(update: FirmwareUpdateUi): List<LightBarButton> = when (update) {
-        // DIAG takes UPDATE's single slot on a device we cannot flash from here.
-        is FirmwareUpdateUi.Available ->
+    private fun updateButtons(
+        update: FirmwareUpdateUi,
+        method: FirmwareUpdateMethod?,
+    ): List<LightBarButton> = when (update) {
+        is FirmwareUpdateUi.Available -> buildList {
             if (update.installable) {
-                listOf(LightBarButton.Text(text = "UPDATE", onClick = viewModel::startUpdate))
-            } else {
-                listOf(LightBarButton.Text(text = "DIAG", onClick = viewModel::runAirohaDiagnostics))
+                add(LightBarButton.Text(text = "UPDATE", onClick = viewModel::startUpdate))
             }
+            // The RACE probe stays reachable on Airoha chips, where the install
+            // path itself rides that socket, and on anything we cannot flash.
+            if (!update.installable || method == FirmwareUpdateMethod.MTK) {
+                add(LightBarButton.Text(text = "DIAG", onClick = viewModel::runAirohaDiagnostics))
+            }
+        }
         is FirmwareUpdateUi.Unsupported -> listOf(
             LightBarButton.Text(text = "DIAG", onClick = viewModel::runAirohaDiagnostics),
         )
@@ -220,14 +227,14 @@ class SonyWfHomeScreen(sealedActivity: SealedLightActivity) :
                     align = TextAlign.Center,
                 )
             }
-            updateLine(s.update)?.let {
+            updateLine(s.update, s.updateMethod)?.let {
                 LightText(
                     text = it,
                     variant = LightTextVariant.Copy,
                     align = TextAlign.Center,
                 )
             }
-            updateHint(s.update)?.let {
+            updateHint(s.update, s.updateMethod)?.let {
                 LightText(
                     text = it,
                     variant = LightTextVariant.Fine,
@@ -257,7 +264,7 @@ class SonyWfHomeScreen(sealedActivity: SealedLightActivity) :
     }
 
     /** One status line for the update flow; null when there is nothing to say. */
-    private fun updateLine(update: FirmwareUpdateUi): String? = when (update) {
+    private fun updateLine(update: FirmwareUpdateUi, method: FirmwareUpdateMethod?): String? = when (update) {
         is FirmwareUpdateUi.Unknown -> null
         is FirmwareUpdateUi.Checking -> "Checking for updates"
         is FirmwareUpdateUi.UpToDate -> "Up to date"
@@ -266,19 +273,32 @@ class SonyWfHomeScreen(sealedActivity: SealedLightActivity) :
         is FirmwareUpdateUi.Confirming -> "Install firmware ${update.version}?"
         is FirmwareUpdateUi.Downloading -> "Downloading ${update.percent}%"
         is FirmwareUpdateUi.Transferring -> "Transferring ${update.percent}%"
-        is FirmwareUpdateUi.Installing -> "Installing… keep the app open"
+        // MTK installs happen on the headphones after a reboot, not over our link.
+        is FirmwareUpdateUi.Installing ->
+            if (method == FirmwareUpdateMethod.MTK) {
+                "Installing, headphones will restart"
+            } else {
+                "Installing… keep the app open"
+            }
         is FirmwareUpdateUi.Completed -> "Update complete"
         is FirmwareUpdateUi.Failed -> update.message
         is FirmwareUpdateUi.Diagnostics -> null // DiagnosticsBody owns the whole body
     }
 
     /** Secondary line: the non-installable route, and the pre-install warning. */
-    private fun updateHint(update: FirmwareUpdateUi): String? = when (update) {
+    private fun updateHint(update: FirmwareUpdateUi, method: FirmwareUpdateMethod?): String? = when (update) {
         is FirmwareUpdateUi.Available ->
             if (update.installable) null else "Install with Sony Sound Connect app"
+        // The Airoha transfer is far slower than Tandem's and mutes audio, so say so.
         is FirmwareUpdateUi.Confirming ->
-            "Keep the headphones on, near the phone, and this app open.\n" +
-                "Do not use them until the update finishes."
+            if (method == FirmwareUpdateMethod.MTK) {
+                "The transfer takes 15 to 40 minutes. Keep the headphones on\n" +
+                    "and within reach; audio may pause while it runs.\n" +
+                    "Keep the phone on this screen until it finishes."
+            } else {
+                "Keep the headphones on, near the phone, and this app open.\n" +
+                    "Do not use them until the update finishes."
+            }
         is FirmwareUpdateUi.Completed -> "Firmware ${update.version}"
         else -> null
     }

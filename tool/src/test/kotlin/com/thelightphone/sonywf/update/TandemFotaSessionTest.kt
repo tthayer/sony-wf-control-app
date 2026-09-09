@@ -230,7 +230,8 @@ class TandemFotaSessionTest {
         assertEquals(setOf(0x30), client.supportFunctions.value)
         assertEquals(FirmwareUpdateMethod.TANDEM, client.updateMethod.value)
         assertEquals(
-            UpdateCapability(resumable = true, tws = true, backgroundTransfer = false, acCheck = false),
+            // 31 10 04 01 01 00 00: EnableDisable ENABLE is 0x00, Topology TWS is 0x01.
+            UpdateCapability(resumable = false, tws = true, backgroundTransfer = true, acCheck = true),
             client.updateCapability.value,
         )
         assertEquals(30, client.updateParams.value?.batteryThreshold)
