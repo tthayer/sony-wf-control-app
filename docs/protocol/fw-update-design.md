@@ -323,3 +323,88 @@ ViewModel behaviour:
   chain), decode + parse + select; rule operators; version compare; verifyBinary; effectiveSerial.
 - `SonyProtocolClientTest` additions: V2 start() issues 06 00 / 04 01 / 30 10 / 36 10 and populates
   the new flows; `sendReliable` resends on missing Ack and returns false after budget.
+
+---
+
+## 10. MTK / Airoha path (WH-1000XM5 and other MediaTek devices)
+
+Wire source of truth: `spec-airoha-mt28xx-single.md` (byte-exact, MT2822/MT2833/MT2855 single device),
+overview in `spec-airoha-fota.md`. On-device facts (WH-1000XM5, 2026-09-09): chip name `MT2822S`,
+partition addr `0x00BDA000` len `0x00962000` storageType 0, state `0x0101`; GetVersion/GetBattery
+answer 0x5B with an empty payload, so nothing may depend on them. Framing confirmed.
+
+Scope v1: single device only (capability `tws == false`), chips MT2822 and MT2833 (mode byte
+Background `0x00` when `UpdateCapability.backgroundTransfer` else Active `0x01`). MT2855 and TWS
+devices → `Failed(OTHER, "unsupported: …")` before anything is written.
+
+### 10.1 MTK capability reply (fixes §4 `parseCapability`)
+
+`UPDT_RET_CAPABILITY` for MTK inquired types 0x02/0x04/0x05/0x07: `{0x31, inq, 0x03, resumable,
+tws, backgroundTransfer}` (payload len 6; each EnableDisable). For inquired type 0x06 the layout
+carries a 4th field `acCheck`; read `eg0/o.java` in the decompile for the byte order and map via
+`wv/a.java q()` (`V(bg, resumable, tws, acCheck, inq)`). `parseCapability` must accept all of these
+and the Tandem PART1 layout.
+
+### 10.2 Package `update.airoha`
+
+```kotlin
+object Crc8 { fun of(data: ByteArray): Int }      // poly 0x31 MSB-first, init 0, refout (bit-reverse the final byte); vectors in spec §G
+object FlashPlan {
+    const val SECTOR = 4096; const val PAGE = 256; const val REGION = 512 * 1024
+    class Sector(val addr: Int, val data: ByteArray /* 4096, 0xFF padded */, var erased: Boolean = false, var needsWrite: Boolean = true)
+    fun sectors(image: ByteArray, partitionAddr: Int): List<Sector>
+    fun pages(sector: Sector): List<Pair<Int, ByteArray>>   // (addr, 256 bytes), all-0xFF pages dropped
+    fun record(addr: Int, page: ByteArray): ByteArray       // 261 B: crc8 | addr LE32 | data
+}
+data class PartitionInfo(val id: Int, val storageType: Int, val addr: Int, val length: Int)
+
+class AirohaFotaSession(private val race: RaceClient, private val clock: () -> Long = System::currentTimeMillis) {
+    val phase: StateFlow<FotaPhase>          // reuse FotaPhase/FotaFailure from update/TandemFotaSession.kt
+    suspend fun readChipName(): String?      // 0x0A00 key 0x1002
+    suspend fun inquiry(): PartitionInfo?    // 0x1C00 {00}
+    suspend fun queryState(): Int?           // 0x1C04 → LE16 state
+    /** Full single-device transfer per spec §3.0 (steps 1-14). Returns terminal-or-Transferred phase; on success the device state is 0x0211. */
+    suspend fun transfer(image: ByteArray, mode: Int): FotaPhase
+    /** 0x1C02 {00}; success = status 0 or the socket dropping within 9 s. */
+    suspend fun commit(): Boolean
+    suspend fun cancel(reason: Int)          // 0x1C03 {07, 01, reason}
+}
+```
+
+`transfer()` rules:
+- Size guard: `ceil(len/4096)*4096 <= partition.length - 4096` else `Failed(OTHER)`.
+- 0x1C08 `{01, mode}`; after status 0 every later frame uses flag 0x15 and RX frames without bit 0x10 are ignored.
+- 0x1C1C `{01, 00}`: response optional; if present use LE16 interval (rx[9..10]) as pacing when > 0.
+- 0x0433 per 512 KB region → mark `erased` from the bitmap (bit i = bitmap[i/8] & (0x80 >> (i%8)) set ⇒ already erased).
+- 0x0431 over every maximal run of consecutive NOT-erased sectors (addr, len): device SHA-256 at rx[17..48] == SHA-256(local run data) ⇒ run `needsWrite = false` and no erase. Erased sectors are never compared; they are written, never erased again.
+- 0x1C0A; WriteState 0x0200 (skip together with erase when nothing needs erasing); 0x0404 per sector needing erase, low address first, `{storageType, 00 10 00 00, addr LE32}` (confirm order in spec §3.8); WriteState 0x0201, 0x0210.
+- 0x0402 writes: Background mode → long packets: up to 3 command frames concatenated into one write, ≤ 4 commands outstanding, pacing 200 ms (or 0x1C1C interval) between writes, resend a command whose packet index is ≥ 3 behind the newest and still unacked; Active mode → same code with pacing 0. Ack = 0x5B with status 0 and the page address listed at rx[9..] (count at rx[8]). Busy bit `status & 0x80` ⇒ retry that page after the pacing delay. Progress = written pages / total pages.
+- 0x1C01 `{01, 00, storageType}`; WriteState 0x0211; 0x1C04 must return 0x0211 else `Failed(DEVICE_REFUSED)`.
+- Every command: 9000 ms response timeout, 3 attempts, response type per spec table (0x5D for 0x1C08/0x1C1C/0x0433/0x0431/0x0404/0x1C01, 0x5B otherwise); a 0x5B with non-zero status for a 0x5D-typed command is an immediate failure.
+
+### 10.3 `update/MtkUpdateController.kt`
+
+```kotlin
+class MtkUpdateController(
+    private val client: SonyProtocolClient,                       // MDR link, stays connected
+    private val openAiroha: suspend () -> LightSerialConnection,   // secure RFCOMM to AirohaDiagnostics.SPP_UUID
+    private val reconnect: suspend () -> SonyProtocolClient?,      // same hook as TandemFotaSession
+    private val scope: CoroutineScope,
+) {
+    val phase: StateFlow<FotaPhase>
+    suspend fun run(image: FirmwareImage, inquiredType: Int, capability: UpdateCapability?): FotaPhase
+    suspend fun cancel()
+}
+```
+
+`run`: (1) MDR `UPDT_SET_STATUS {0x34, inq, 0x01}` via `sendReliable` (failure → `Failed(DEVICE_REFUSED)`);
+(2) open Airoha socket, `readChipName()`; not MT2822/MT2833 (substrings "2822"/"1568"/"1565" → 2822;
+"283"/"158"/"157" → 2833) or `capability?.tws == true` → `Failed(OTHER, "unsupported …")`; close and
+reopen the socket (Sony does); (3) `transfer(image.bytes, mode)`, mirroring phase; (4) MDR
+`UPDT_SET_STATUS` enable again; `Executing`; `commit()`; (5) `Installing`: wait for the MDR link to
+drop, then `reconnect()` every 3 s for up to 480 s; new client's `firmwareVersion == image.version`
+⇒ `Completed`, a different version ⇒ `Failed(OTHER, "version mismatch")`, timeout ⇒ `Failed(TIMEOUT)`.
+`cancel()`: Airoha 0x1C03 reason 1 if transferring, then MDR `UPDT_SET_STATUS {0x34, inq, 0x00}`.
+
+ViewModel: MTK devices become `Available(installable = true)`; `confirmUpdate` picks
+`MtkUpdateController` when `updateMethod == MTK`, else `TandemFotaSession`. Battery gate unchanged.
