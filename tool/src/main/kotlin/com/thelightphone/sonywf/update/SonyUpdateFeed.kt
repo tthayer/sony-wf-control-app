@@ -230,6 +230,8 @@ object SonyUpdateFeed {
      * elements are located anywhere in the document.
      */
     fun parseInfo(xml: String): List<ApplyCondition> {
+        // Parser feature support differs per platform, so refuse DTDs up front.
+        if (xml.contains("<!DOCTYPE", ignoreCase = true)) throw FeedException("info.xml parse failed: DTD not allowed")
         val document = try {
             hardenedBuilder().parse(ByteArrayInputStream(xml.toByteArray(Charsets.UTF_8)))
         } catch (e: Exception) {
@@ -285,8 +287,9 @@ object SonyUpdateFeed {
         )
         runCatching { factory.setAttribute(ACCESS_EXTERNAL_DTD, "") }
         runCatching { factory.setAttribute(ACCESS_EXTERNAL_SCHEMA, "") }
-        factory.isXIncludeAware = false
-        factory.isExpandEntityReferences = false
+        // Android's DocumentBuilderFactory throws UnsupportedOperationException here.
+        runCatching { factory.isXIncludeAware = false }
+        runCatching { factory.isExpandEntityReferences = false }
         return factory.newDocumentBuilder()
     }
 

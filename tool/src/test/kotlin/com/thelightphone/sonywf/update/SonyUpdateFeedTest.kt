@@ -493,4 +493,11 @@ class SonyUpdateFeedTest {
         assertEquals("https://x/a.bin", SonyUpdateFeed.forceHttps("https://x/a.bin"))
         assertEquals("ftp://x/a.bin", SonyUpdateFeed.forceHttps("ftp://x/a.bin"))
     }
+
+    @Test
+    fun `parseInfo rejects documents with a DTD`() {
+        val xml = """<!DOCTYPE x [<!ENTITY e SYSTEM "file:///etc/hosts">]><Root><ApplyConditions/></Root>"""
+        val e = assertFailsWith<FeedException> { SonyUpdateFeed.parseInfo(xml) }
+        assertTrue(e.message!!.contains("DTD"))
+    }
 }
