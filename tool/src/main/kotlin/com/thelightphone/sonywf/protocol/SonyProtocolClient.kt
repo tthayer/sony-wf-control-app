@@ -6,6 +6,7 @@ import com.thelightphone.sonywf.update.FirmwareUpdateMethods
 import com.thelightphone.sonywf.update.UpdateCapability
 import com.thelightphone.sonywf.update.UpdateParams
 import com.thelightphone.sonywf.update.UpdtMessages
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
@@ -339,6 +340,8 @@ class SonyProtocolClient(
                 val written = try {
                     connection.write(frame)
                     true
+                } catch (e: CancellationException) {
+                    throw e
                 } catch (_: Exception) {
                     false
                 }

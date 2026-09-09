@@ -351,6 +351,8 @@ class TandemFotaSessionTest {
 
         assertEquals(FotaPhase.Completed, TandemFotaSession(client) { currentTime }.run(image(500)))
         assertEquals(0, conn.chunks.size)
+        // Sony skips FINISH_TRANSFER on this path (spec-tandem-fota §4.3).
+        assertEquals(0, payloadsWithOpcode(conn.writes, 0x38, 0x11, 0x04).size)
         assertEquals(1, payloadsWithOpcode(conn.writes, 0x38, 0x13, 0x06).size)
 
         client.stop()

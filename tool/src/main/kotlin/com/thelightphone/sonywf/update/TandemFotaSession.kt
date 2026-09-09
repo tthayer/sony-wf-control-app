@@ -142,11 +142,12 @@ class TandemFotaSession(
             transferChunks(image, start.maxPacketSize, start.offset)?.let { return it }
         }
 
-        // 4. FINISH_TRANSFER. When the device said NO_NEED_OF_DATA_TRANSFER it is
-        // already back in IDLE and may reject FINISH (spec §4.3 skips it there),
-        // so a failure on that path is not fatal.
-        _phase.value = FotaPhase.Finishing
-        finishTransfer()?.let { if (!noNeedOfTransfer) return it }
+        // 4. FINISH_TRANSFER. Skipped after NO_NEED_OF_DATA_TRANSFER: the device
+        // is already IDLE and the Sony app does not send FINISH there (spec §4.3).
+        if (!noNeedOfTransfer) {
+            _phase.value = FotaPhase.Finishing
+            finishTransfer()?.let { return it }
+        }
         if (cancelRequested) return FotaPhase.Cancelled
 
         // 5. EXECUTE_FW_UPDATE.
