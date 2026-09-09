@@ -154,6 +154,8 @@ class MtkUpdateController(
         _phase.value = FotaPhase.Installing(0, 0)
         val startedAt = clock()
         val deadline = startedAt + INSTALL_TIMEOUT_MS
+        // Seeing this version again means the device has not rebooted yet, not a failure.
+        val previousVersion = client.firmwareVersion.value
 
         // The link normally dies within seconds; if it does not, start polling
         // anyway rather than burning the whole budget on the wait.
@@ -165,10 +167,10 @@ class MtkUpdateController(
             _phase.value = FotaPhase.Installing(percent, 0)
             val fresh = redial() ?: continue
             val version = fresh.firmwareVersion.value
-            return if (version == image.version) {
-                FotaPhase.Completed
-            } else {
-                FotaPhase.Failed(FotaFailure.OTHER, "version mismatch: reported ${version ?: "none"}")
+            when {
+                version == image.version -> return FotaPhase.Completed
+                version == null || version == previousVersion -> continue
+                else -> return FotaPhase.Failed(FotaFailure.OTHER, "version mismatch: reported $version")
             }
         }
         return FotaPhase.Failed(FotaFailure.TIMEOUT, "install not confirmed")

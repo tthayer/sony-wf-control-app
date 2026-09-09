@@ -176,7 +176,7 @@ class MtkUpdateControllerTest {
         runCurrent()
 
         val airoha = FakeAirohaFotaDevice(AirohaDeviceConfig(onCommit = { mdr.close() }))
-        val rebooted = FakeMdrConnection(firmwareVersion = "1.0.0") // never updated
+        val rebooted = FakeMdrConnection(firmwareVersion = "1.5.0") // neither old nor expected
         val freshClient = SonyProtocolClient(rebooted, backgroundScope)
 
         val controller = MtkUpdateController(
@@ -196,6 +196,36 @@ class MtkUpdateControllerTest {
         val failed = assertIs<FotaPhase.Failed>(terminal)
         assertEquals(FotaFailure.OTHER, failed.reason)
         assertTrue(failed.detail.contains("version mismatch"))
+        advanceUntilIdle()
+    }
+
+    @Test
+    fun aDeviceStillOnTheOldVersionIsPolledUntilTheDeadline() = runTest {
+        val mdr = FakeMdrConnection(firmwareVersion = "1.0.0")
+        val client = SonyProtocolClient(mdr, backgroundScope)
+        client.start()
+        runCurrent()
+
+        val airoha = FakeAirohaFotaDevice(AirohaDeviceConfig(onCommit = { mdr.close() }))
+        var redials = 0
+        val controller = MtkUpdateController(
+            client = client,
+            openAiroha = { airoha.openSocket() },
+            reconnect = {
+                redials++
+                // Still the old firmware: the reboot has not happened yet.
+                SonyProtocolClient(FakeMdrConnection(firmwareVersion = "1.0.0"), backgroundScope).also { it.start() }
+            },
+            scope = backgroundScope,
+            clock = { currentTime },
+        )
+
+        val image = FirmwareImage(payload(256), "2.0.0", "fw.bin", DigestType.NONE, "")
+        val terminal = controller.run(image, 0x04, client.updateCapability.value)
+
+        val failed = assertIs<FotaPhase.Failed>(terminal)
+        assertEquals(FotaFailure.TIMEOUT, failed.reason)
+        assertTrue(redials > 1)
         advanceUntilIdle()
     }
 
