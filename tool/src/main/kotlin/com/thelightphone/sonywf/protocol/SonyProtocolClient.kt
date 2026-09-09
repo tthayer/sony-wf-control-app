@@ -10,6 +10,7 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.channels.BufferOverflow
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharedFlow
@@ -89,7 +90,13 @@ class SonyProtocolClient(
     private val _updateParams = MutableStateFlow<UpdateParams?>(null)
     val updateParams: StateFlow<UpdateParams?> = _updateParams.asStateFlow()
 
-    private val _notifications = MutableSharedFlow<SonyMessage>(replay = 0, extraBufferCapacity = 256)
+    private val _notifications = MutableSharedFlow<SonyMessage>(
+        replay = 0,
+        // A firmware transfer bursts notifications; dropping the oldest keeps the
+        // inbound loop non-blocking rather than losing the newest status.
+        extraBufferCapacity = 1024,
+        onBufferOverflow = BufferOverflow.DROP_OLDEST,
+    )
     /**
      * Every inbound Command1/Command2 message, emitted before the auto-Ack.
      * The FOTA state machine drives itself off this: it survives a connection
@@ -109,6 +116,14 @@ class SonyProtocolClient(
     /** Completed by the inbound loop when the Ack for an in-flight send lands. */
     @Volatile
     private var pendingAck: CompletableDeferred<Unit>? = null
+
+    /**
+     * Ack seq the outstanding frame expects, i.e. `1 - frame.seq`; -1 when no
+     * frame is outstanding. A resend can draw a duplicate Ack, so an Ack that
+     * does not match must neither complete a wait nor toggle [seq].
+     */
+    @Volatile
+    private var pendingAckSeq: Int = -1
 
     /** Completed by the inbound loop when the Init reply (Command1, payload[0]==0x01) arrives. */
     @Volatile
@@ -171,7 +186,13 @@ class SonyProtocolClient(
     suspend fun start() {
         if (receiveJob == null) {
             receiveJob = scope.launch {
-                connection.incoming.collect { chunk -> onChunk(chunk) }
+                try {
+                    connection.incoming.collect { chunk -> onChunk(chunk) }
+                } finally {
+                    // The transport is gone for good; the FOTA install phase
+                    // watches this to know it must redial after the reboot.
+                    _connected.value = false
+                }
             }
         }
 
@@ -180,11 +201,15 @@ class SonyProtocolClient(
         var reply: SonyMessage? = null
         var attempts = 0
         while (attempts < INIT_MAX_ATTEMPTS && reply == null) {
+            // Registered so the Init Ack still toggles seq even though this
+            // write waits for the Init REPLY rather than for its Ack.
+            pendingAckSeq = (1 - seq) and 0xFF
             connection.write(SonyFrame.encode(SonyFrame.TYPE_COMMAND1, seq, SonyCommands.INIT_PAYLOAD))
             attempts++
             reply = withTimeoutOrNull(INIT_RETRY_MS) { initReply.await() }
         }
         pendingInitReply = null
+        pendingAckSeq = -1
 
         val detected = reply?.let { SonyResponses.parseInitReplyDialect(it.payload) }
             ?: throw IllegalStateException("No Sony Init reply after $attempts attempt(s); not a Sony device")
@@ -333,10 +358,12 @@ class SonyProtocolClient(
         sendMutex.withLock {
             // Encode once so every resend is byte-identical, seq included.
             val frame = SonyFrame.encode(type, seq, payload)
+            val expectedAckSeq = (1 - seq) and 0xFF
             var attempt = 0
             while (attempt <= maxResends) {
                 val ack = CompletableDeferred<Unit>()
                 pendingAck = ack
+                pendingAckSeq = expectedAckSeq
                 val written = try {
                     connection.write(frame)
                     true
@@ -346,7 +373,10 @@ class SonyProtocolClient(
                     false
                 }
                 val acked = if (written) withTimeoutOrNull(ackTimeoutMs) { ack.await() } != null else null
-                if (pendingAck === ack) pendingAck = null // clear on timeout / failure
+                if (pendingAck === ack) { // clear on timeout / failure
+                    pendingAck = null
+                    pendingAckSeq = -1
+                }
                 if (acked == true) return@withLock true
                 attempt++
             }
@@ -396,12 +426,18 @@ class SonyProtocolClient(
     private fun handleMessage(message: SonyMessage) {
         when (message.type) {
             SonyFrame.TYPE_ACK -> {
-                // The device's Ack seq is (1 - our command's seq); adopting it
-                // naturally toggles our sequence number for the next command.
-                seq = message.seq
-                val ack = pendingAck
-                pendingAck = null
-                ack?.complete(Unit)
+                // Ignore an Ack that is not for the outstanding frame: a stale
+                // duplicate (the device Acking a resend twice) would otherwise
+                // complete the NEXT frame's wait and desync the seq.
+                if (message.seq == pendingAckSeq) {
+                    // The device's Ack seq is (1 - our command's seq); adopting
+                    // it toggles our sequence number for the next command.
+                    seq = message.seq
+                    pendingAckSeq = -1
+                    val ack = pendingAck
+                    pendingAck = null
+                    ack?.complete(Unit)
+                }
             }
 
             SonyFrame.TYPE_COMMAND1, SonyFrame.TYPE_COMMAND2 -> {

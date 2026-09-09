@@ -87,10 +87,24 @@ object SonyUpdateFeed {
 
     const val INSTALL_TYPE_BINARY = "binary"
 
+    /** What a device-reported id may contain to be used as a URL path segment. */
+    private val PATH_SEGMENT = Regex("^[A-Za-z0-9._-]+$")
+
     // ---- URL / device identity ---------------------------------------------
 
-    fun infoUrl(categoryId: String, serviceId: String): String =
-        "https://$HOST/$categoryId/$serviceId/info/info.xml"
+    /** @throws FeedException if either id would not be a safe single path segment. */
+    fun infoUrl(categoryId: String, serviceId: String): String {
+        // The device supplies these, so they must not be able to escape the path.
+        requirePathSegment(categoryId, "categoryId")
+        requirePathSegment(serviceId, "serviceId")
+        return "https://$HOST/$categoryId/$serviceId/info/info.xml"
+    }
+
+    private fun requirePathSegment(value: String, what: String) {
+        if (!PATH_SEGMENT.matches(value) || value == "." || value == "..") {
+            throw FeedException("illegal $what for the info URL: '$value'")
+        }
+    }
 
     /**
      * spec §1.4: for three models Sony ignores the serial the device reports and

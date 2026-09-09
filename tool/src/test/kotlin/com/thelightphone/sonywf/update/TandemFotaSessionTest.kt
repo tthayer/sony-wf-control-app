@@ -20,6 +20,7 @@ import kotlin.test.Test
 import kotlin.test.assertContentEquals
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
+import kotlin.test.assertFalse
 import kotlin.test.assertIs
 import kotlin.test.assertTrue
 
@@ -47,6 +48,10 @@ private class FotaDevice(
     val completeOnExecute: Boolean = true,
     /** Virtual milliseconds each firmware chunk takes, so tests can interleave. */
     val chunkDelayMs: Long = 0,
+    /** Firmware version reported by the 0x04/0x02 query. */
+    val firmwareVersion: String = "2.0.0",
+    /** Emulate the reboot: the transport dies right after EXECUTE is answered. */
+    val closeAfterExecute: Boolean = false,
 )
 
 /**
@@ -142,7 +147,7 @@ private class FakeFotaConnection(private val device: FotaDevice) : LightSerialCo
             op == 0x00 && sub == 0x00 -> sendCommand1(ByteArray(8).also { it[0] = 0x01 }) // V2 Init reply
             op == 0x22 -> sendCommand1(b(0x23, 0x09, 70, 0x00, 80, 0x00))
             op == 0x66 -> sendCommand1(b(0x67, 0x15, 0x01, 0x01, 0x00, 0x00, 0x00))
-            op == 0x04 && sub == 0x02 -> sendCommand1(b(0x05, 0x02) + str("2.0.0"))
+            op == 0x04 && sub == 0x02 -> sendCommand1(b(0x05, 0x02) + str(device.firmwareVersion))
             op == 0x04 && sub == 0x01 -> sendCommand1(b(0x05, 0x01) + str("WF-1000XM5"))
             op == 0x06 -> sendCommand1(supportFunctionReply())
             op == 0x30 -> sendCommand1(b(0x31, 0x10, 0x04, 0x01, 0x01, 0x00, 0x00))
@@ -180,6 +185,8 @@ private class FakeFotaConnection(private val device: FotaDevice) : LightSerialCo
                 if (device.executeResult == 0x00) {
                     sendCommand1(b(0x35, 0x10, 0x04)) // UPDATING
                     if (device.completeOnExecute) deliverCompleted()
+                    // The buffered frames above still drain before `incoming` ends.
+                    if (device.closeAfterExecute) close()
                 }
             }
         }
@@ -423,6 +430,83 @@ class TandemFotaSessionTest {
         conn.deliverCompleted()
         runCurrent()
         assertEquals(FotaPhase.Completed, run.await())
+    }
+
+    @Test
+    fun rebootDuringInstallReconnectsAndTrustsTheNewFirmwareVersion() = runTest {
+        val conn = FakeFotaConnection(
+            FotaDevice(
+                maxPacketSize = 256,
+                requiredTimeSec = 40,
+                completeOnExecute = false,
+                closeAfterExecute = true,
+            ),
+        )
+        val client = SonyProtocolClient(conn, backgroundScope)
+        client.start()
+        runCurrent()
+
+        // The rebooted device reports the new version and never re-sends
+        // FW_UPDATE_COMPLETED, which is the only signal a fresh session gets.
+        val fresh = FakeFotaConnection(FotaDevice(firmwareVersion = "3.0.1", completeOnExecute = false))
+        var attempts = 0
+        var reconnected: SonyProtocolClient? = null
+        val session = TandemFotaSession(
+            client,
+            reconnect = {
+                attempts++
+                // Away on the first poll, back on the second.
+                if (attempts < 2) {
+                    null
+                } else {
+                    SonyProtocolClient(fresh, backgroundScope).also {
+                        it.start()
+                        reconnected = it
+                    }
+                }
+            },
+        ) { currentTime }
+
+        val run = async { session.run(image(300)) }
+        runCurrent()
+        assertIs<FotaPhase.Installing>(session.phase.value)
+        assertFalse(client.connected.value, "the closed transport must flip connected")
+
+        advanceTimeBy(10_000) // two 3 s reconnect polls
+        assertEquals(FotaPhase.Completed, run.await())
+        assertEquals(2, attempts)
+
+        reconnected?.stop()
+        client.stop()
+    }
+
+    @Test
+    fun installTimesOutWhenTheDeviceNeverComesBack() = runTest {
+        val conn = FakeFotaConnection(
+            FotaDevice(
+                maxPacketSize = 256,
+                requiredTimeSec = 40,
+                completeOnExecute = false,
+                closeAfterExecute = true,
+            ),
+        )
+        val client = SonyProtocolClient(conn, backgroundScope)
+        client.start()
+        runCurrent()
+
+        var attempts = 0
+        val session = TandemFotaSession(client, reconnect = { attempts++; null }) { currentTime }
+        val run = async { session.run(image(300)) }
+        runCurrent()
+
+        // Deadline is 2 x requiredTime = 80 s.
+        advanceTimeBy(85_000)
+        val failed = assertIs<FotaPhase.Failed>(run.await())
+        assertEquals(FotaFailure.TIMEOUT, failed.reason)
+        assertEquals("install not confirmed", failed.detail)
+        assertTrue(attempts > 1, "expected repeated redial attempts, got $attempts")
+
+        client.stop()
     }
 
     @Test

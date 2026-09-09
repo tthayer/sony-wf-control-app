@@ -70,6 +70,23 @@ class UpdtMessagesTest {
     }
 
     @Test
+    fun startTransferWithABlankMacDeclaresMacTypeNone() {
+        // The feed can advertise a digest but ship no MAC; macType must then be
+        // NONE with macLen 0, or the device rejects the frame.
+        for (digest in listOf(DigestType.MD5, DigestType.SHA1)) {
+            assertContentEquals(
+                bytes(0x38, 0x12, 0x03) + str("1.0") + bytes(0x00, 0x01) + str("f") + bytes(0x00, 0x00),
+                UpdtMessages.startTransfer("1.0", "f", digest, ""),
+                "digest $digest",
+            )
+        }
+        assertContentEquals(
+            bytes(0x38, 0x12, 0x03) + str("1.0") + bytes(0x00, 0x01) + str("f") + bytes(0x00, 0x00),
+            UpdtMessages.startTransfer("1.0", "f", DigestType.MD5, "   "),
+        )
+    }
+
+    @Test
     fun startTransferRejectsWrongMacLength() {
         assertFailsWith<IllegalArgumentException> {
             UpdtMessages.startTransfer("1.0", "f", DigestType.MD5, "abc")

@@ -7,7 +7,9 @@ import com.thelightphone.sonywf.update.UpdateParams
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.receiveAsFlow
+import kotlinx.coroutines.async
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.test.advanceTimeBy
 import kotlinx.coroutines.test.advanceUntilIdle
 import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
@@ -148,6 +150,51 @@ private class SilentConnection : LightSerialConnection {
     override suspend fun write(bytes: ByteArray) {
         writes.add(bytes.copyOf())
     }
+
+    override fun close() {
+        isConnected = false
+        channel.close()
+    }
+}
+
+/**
+ * Answers the V2 Init handshake while [autoAck] is on, then hands Ack timing to
+ * the test so out-of-order / duplicate Acks can be injected.
+ */
+private class ManualAckConnection : LightSerialConnection {
+    val writes = mutableListOf<ByteArray>()
+
+    /** While false, writes are recorded but nothing is Acked or answered. */
+    var autoAck: Boolean = true
+
+    private val channel = Channel<ByteArray>(Channel.UNLIMITED)
+    override val incoming: Flow<ByteArray> = channel.receiveAsFlow()
+    override var isConnected: Boolean = true
+        private set
+
+    private val decoder = SonyFrameDecoder()
+
+    override suspend fun write(bytes: ByteArray) {
+        writes.add(bytes.copyOf())
+        if (!autoAck) return
+        for (msg in decoder.feed(bytes)) {
+            if (msg.type == SonyFrame.TYPE_ACK) continue // our own auto-Ack
+            ack((1 - msg.seq) and 0xFF)
+            val p = msg.payload
+            if (p.size >= 2 && p[0].toInt() == 0x00 && p[1].toInt() == 0x00) {
+                channel.trySend(
+                    SonyFrame.encode(SonyFrame.TYPE_COMMAND1, 1, ByteArray(8).also { it[0] = 0x01 }),
+                )
+            }
+        }
+    }
+
+    fun ack(seq: Int) {
+        channel.trySend(SonyFrame.encode(SonyFrame.TYPE_ACK, seq, ByteArray(0)))
+    }
+
+    /** Seq of the last frame the client wrote. */
+    fun lastSeq(): Int = decodeWrites(writes).last().seq
 
     override fun close() {
         isConnected = false
@@ -568,6 +615,53 @@ class SonyProtocolClientTest {
         // 1 initial write + 2 resends, all byte-identical: same seq on every try.
         assertEquals(3, conn.writes.size)
         assertTrue(conn.writes.all { it.contentEquals(conn.writes[0]) })
+
+        client.stop()
+    }
+
+    @Test
+    fun staleDuplicateAckDoesNotCompleteTheNextFrame() = runTest {
+        val conn = ManualAckConnection()
+        val client = SonyProtocolClient(conn, backgroundScope)
+        client.start()
+        advanceUntilIdle()
+
+        conn.autoAck = false
+        conn.writes.clear()
+
+        // Frame A: the first Ack is withheld, so the client resends the same
+        // frame; the device then Acks the resend (and, later, duplicates it).
+        val sendA = async { client.sendReliable(SonyFrame.TYPE_COMMAND1, b(0x38, 0x11, 0x01), 2000L, maxResends = 1) }
+        runCurrent()
+        val seqA = conn.lastSeq()
+        advanceTimeBy(2100) // first attempt times out -> resend
+        assertEquals(2, conn.writes.size)
+        conn.ack((1 - seqA) and 0xFF)
+        runCurrent()
+        assertTrue(sendA.await())
+
+        // Frame B uses the toggled seq and expects the opposite Ack seq.
+        conn.writes.clear()
+        val sendB = async { client.sendReliable(SonyFrame.TYPE_COMMAND1, b(0x38, 0x11, 0x04), 2000L, maxResends = 0) }
+        runCurrent()
+        val seqB = conn.lastSeq()
+        assertEquals((1 - seqA) and 0xFF, seqB)
+
+        // The device's duplicate Ack for frame A must be ignored.
+        conn.ack((1 - seqA) and 0xFF)
+        runCurrent()
+        assertTrue(sendB.isActive, "a stale Ack must not complete the next frame")
+
+        conn.ack((1 - seqB) and 0xFF)
+        runCurrent()
+        assertTrue(sendB.await())
+
+        // Seq stayed consistent: frame C is back on frame A's seq.
+        conn.writes.clear()
+        val sendC = async { client.sendReliable(SonyFrame.TYPE_COMMAND1, b(0x38, 0x11, 0x02), 2000L, maxResends = 0) }
+        runCurrent()
+        assertEquals(seqA, conn.lastSeq())
+        sendC.cancel()
 
         client.stop()
     }

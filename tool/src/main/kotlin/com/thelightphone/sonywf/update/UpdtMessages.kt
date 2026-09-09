@@ -88,11 +88,16 @@ object UpdtMessages {
             DigestType.MD5 -> 32
             DigestType.SHA1 -> 40
         }
-        require(macHex.length == expectedMacLen) {
+        // No MAC to send means MacType NONE with macLen 0, whatever the feed
+        // advertised: the device rejects a macLen that disagrees with macType.
+        val blankMac = macHex.isBlank()
+        require(blankMac || macHex.length == expectedMacLen) {
             "macHex length ${macHex.length} != $expectedMacLen for $digest"
         }
+        val macType = if (blankMac) DigestType.NONE.macType else digest.macType
+        val macBytes = if (blankMac) ByteArray(0) else macHex.toByteArray(Charsets.US_ASCII)
 
-        val out = ArrayList<Byte>(8 + version.size + name.size + expectedMacLen)
+        val out = ArrayList<Byte>(8 + version.size + name.size + macBytes.size)
         out.add(UPDT_SET_PARAM.toByte())
         out.add(PART3.toByte())
         out.add(CMD_START_TRANSFER.toByte())
@@ -102,9 +107,9 @@ object UpdtMessages {
         out.add(0x01) // numFiles
         out.add(name.size.toByte())
         for (byte in name) out.add(byte)
-        out.add(digest.macType.toByte())
-        out.add(expectedMacLen.toByte())
-        for (byte in macHex.toByteArray(Charsets.US_ASCII)) out.add(byte)
+        out.add(macType.toByte())
+        out.add(macBytes.size.toByte())
+        for (byte in macBytes) out.add(byte)
         return out.toByteArray()
     }
 

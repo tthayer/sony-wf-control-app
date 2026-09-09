@@ -5,6 +5,7 @@ import java.io.IOException
 import java.net.URL
 import javax.net.ssl.HttpsURLConnection
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.withContext
 
 /**
@@ -60,10 +61,16 @@ class HttpsUrlFetcher(
             var received = 0L
             connection.inputStream.use { input ->
                 while (true) {
+                    // read() is not interruptible, so cancellation is checked here.
+                    coroutineContext.ensureActive()
                     val read = input.read(buffer)
                     if (read < 0) break
-                    sink.write(buffer, 0, read)
                     received += read
+                    // A server that never stops sending must not exhaust the heap.
+                    if (received > MAX_BODY_BYTES) {
+                        throw IOException("body exceeds $MAX_BODY_BYTES bytes for $url")
+                    }
+                    sink.write(buffer, 0, read)
                     onProgress?.invoke(received, total)
                 }
             }
@@ -77,5 +84,6 @@ class HttpsUrlFetcher(
         const val CHUNK = 16 * 1024
         const val DEFAULT_BUFFER = 32 * 1024
         const val MAX_PRESIZE = 64L * 1024 * 1024
+        const val MAX_BODY_BYTES = 64L * 1024 * 1024
     }
 }

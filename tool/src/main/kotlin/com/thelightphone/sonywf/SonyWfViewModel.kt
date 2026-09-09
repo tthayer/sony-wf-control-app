@@ -88,19 +88,32 @@ class SonyWfViewModel(
     /** Bluetooth name of the connected device; the feed model falls back to it. */
     private var deviceName: String = DEFAULT_DEVICE_NAME
 
+    /** Address + service UUID that actually connected, so the install can redial. */
+    private var deviceAddress: String? = null
+    private var serviceUuid: UUID? = null
+
+    /** True while the screen is hidden / the app is paused. */
+    private var hidden: Boolean = false
+
     /** Last check result, kept so CANCEL / BACK can restore the Available line. */
     private var pendingUpdate: AvailableUpdate? = null
     private var pendingInstallable: Boolean = false
     private var fotaSession: TandemFotaSession? = null
 
-    override fun onScreenShow(screen: SimpleLightScreen<Unit>) = connect()
+    override fun onScreenShow(screen: SimpleLightScreen<Unit>) {
+        hidden = false
+        connect()
+    }
 
-    // Tearing the link down mid-update would brick the transfer, so hold it open.
+    // Tearing the link down mid-update would brick the transfer, so hold it open;
+    // [publishTerminal] releases it once the update finishes.
     override fun onScreenHide(screen: SimpleLightScreen<Unit>) {
+        hidden = true
         if (!updateInProgress()) teardown()
     }
 
     override fun onAppPause() {
+        hidden = true
         if (!updateInProgress()) teardown()
     }
 
@@ -141,6 +154,8 @@ class SonyWfViewModel(
                         connection = conn
                         client = protocol
                         deviceName = device.name ?: DEFAULT_DEVICE_NAME
+                        deviceAddress = device.address
+                        serviceUuid = uuid
                         mirrorState(protocol, deviceName)
                         startUpdateCheck(protocol)
                         return@launch
@@ -258,9 +273,17 @@ class SonyWfViewModel(
             return
         }
         val threshold = protocol.updateParams.value?.batteryThreshold ?: 0
-        if (threshold > 0 && !batteryAbove(connected.battery, threshold)) {
-            _update.value = FirmwareUpdateUi.Failed("Charge above $threshold% first")
-            return
+        if (threshold > 0) {
+            val levels = knownBatteryLevels(connected.battery)
+            if (levels.isEmpty()) {
+                // Flashing on an unknown charge is how a device gets bricked.
+                _update.value = FirmwareUpdateUi.Failed("Battery level unknown")
+                return
+            }
+            if (levels.any { it <= threshold }) {
+                _update.value = FirmwareUpdateUi.Failed("Charge above $threshold% first")
+                return
+            }
         }
         updateJob = viewModelScope.launch {
             _update.value = FirmwareUpdateUi.Downloading(0)
@@ -271,10 +294,10 @@ class SonyWfViewModel(
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
-                _update.value = FirmwareUpdateUi.Failed(e.message ?: "Download failed")
+                publishTerminal(FirmwareUpdateUi.Failed(e.message ?: "Download failed"))
                 return@launch
             }
-            val session = TandemFotaSession(protocol)
+            val session = TandemFotaSession(protocol, reconnect = { reconnectForUpdate() })
             fotaSession = session
             val phaseMirror = launch {
                 session.phase.collect { _update.value = phaseToUi(it, available) }
@@ -287,18 +310,64 @@ class SonyWfViewModel(
                 FotaPhase.Failed(FotaFailure.OTHER, e.message ?: "Update failed")
             }
             phaseMirror.cancel()
-            _update.value = phaseToUi(terminal, available)
             fotaSession = null
+            publishTerminal(phaseToUi(terminal, available))
         }
+    }
+
+    /**
+     * Publish a terminal update state. The link is only held open past
+     * [onScreenHide] / [onAppPause] for the update's sake, so release it now.
+     */
+    private fun publishTerminal(ui: FirmwareUpdateUi) {
+        _update.value = ui
+        if (hidden) teardown()
+    }
+
+    /**
+     * Redial the device mid-install (spec-tandem-fota §4.7): the reboot kills the
+     * RFCOMM socket, so the old client is discarded and a fresh one started on the
+     * same address + service UUID. Returns null while the device is still away.
+     */
+    private suspend fun reconnectForUpdate(): SonyProtocolClient? {
+        val address = deviceAddress ?: return null
+        val uuid = serviceUuid ?: return null
+
+        client?.let { runCatching { it.stop() } }
+        connection?.let { runCatching { it.close() } }
+        client = null
+        connection = null
+
+        val conn = try {
+            bluetooth.connect(address, uuid)
+        } catch (e: LightBluetoothException) {
+            null
+        } ?: return null
+        val protocol = SonyProtocolClient(conn, viewModelScope)
+        try {
+            protocol.start()
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            runCatching { protocol.stop() }
+            runCatching { conn.close() }
+            return null
+        }
+        connection = conn
+        client = protocol
+        mirrorState(protocol, deviceName)
+        return protocol
     }
 
     /** CANCEL / BACK: abandon the confirmation, the download, or the transfer. */
     fun cancelUpdate() {
         when (_update.value) {
             is FirmwareUpdateUi.Confirming -> _update.value = availableUi()
+            // Cancelling the job aborts the in-flight HTTP read (HttpsUrlFetcher
+            // checks the job between reads).
             is FirmwareUpdateUi.Downloading -> {
                 updateJob?.cancel(); updateJob = null
-                _update.value = availableUi()
+                publishTerminal(availableUi())
             }
             // The device must be told, otherwise it stays in FW-update mode.
             is FirmwareUpdateUi.Transferring -> {
@@ -345,9 +414,9 @@ class SonyWfViewModel(
         return FirmwareUpdateUi.Available(update.version, update.sizeBytes, pendingInstallable)
     }
 
-    /** Every reading the device actually reports must be strictly above [threshold]. */
-    private fun batteryAbove(battery: SonyBattery, threshold: Int): Boolean =
-        listOfNotNull(battery.single, battery.left, battery.right).all { it > threshold }
+    /** The bud/headset levels the device actually reports; the case is irrelevant. */
+    private fun knownBatteryLevels(battery: SonyBattery): List<Int> =
+        listOfNotNull(battery.single, battery.left, battery.right)
 
     private fun updateInProgress(): Boolean = when (_update.value) {
         is FirmwareUpdateUi.Downloading,

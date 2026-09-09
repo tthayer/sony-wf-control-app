@@ -3,6 +3,8 @@ package com.thelightphone.sonywf.update
 import com.thelightphone.sonywf.protocol.SonyFrame
 import com.thelightphone.sonywf.protocol.SonyProtocolClient
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.async
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
@@ -14,6 +16,7 @@ import kotlinx.coroutines.flow.mapNotNull
 import kotlinx.coroutines.flow.onEach
 import kotlinx.coroutines.flow.onSubscription
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.selects.select
 import kotlinx.coroutines.withTimeoutOrNull
 
 /** Coarse progress of a Tandem FOTA run, mirrored into the UI. */
@@ -50,12 +53,20 @@ enum class FotaFailure {
  *
  * One [run] per instance.
  *
+ * @param reconnect redials the device and returns a started client, or null if
+ *   it is not back yet. Supplied only for the install phase, where the device
+ *   reboots and the RFCOMM link dies (spec-tandem-fota §4.7). Null means "just
+ *   keep waiting on the old link".
  * @param clock millisecond source, injected so install progress is testable.
  */
 class TandemFotaSession(
-    private val client: SonyProtocolClient,
+    client: SonyProtocolClient,
+    private val reconnect: (suspend () -> SonyProtocolClient?)? = null,
     private val clock: () -> Long = System::currentTimeMillis,
 ) {
+    /** The live client; swapped for a fresh one after a reboot-time redial. */
+    private var current: SonyProtocolClient = client
+
     private val _phase = MutableStateFlow<FotaPhase>(FotaPhase.Idle)
     val phase: StateFlow<FotaPhase> = _phase.asStateFlow()
 
@@ -72,6 +83,11 @@ class TandemFotaSession(
     @Volatile
     private var sendFailed = false
 
+    /** Scope owning the completion watcher; alive only for the duration of [run]. */
+    private var watchScope: CoroutineScope? = null
+
+    private var completionWatcher: Job? = null
+
     /** Runs the full sequence and returns the terminal phase. */
     suspend fun run(image: FirmwareImage): FotaPhase = coroutineScope {
         check(!runStarted) { "TandemFotaSession.run() may only be called once" }
@@ -81,14 +97,15 @@ class TandemFotaSession(
         // unsubscribe as soon as their step is satisfied, and `notifications`
         // has no replay buffer, so without this a completion that arrives while
         // a step is finishing would be dropped.
-        val subscribed = CompletableDeferred<Unit>()
-        val completionWatcher = launch { notifies(subscribed).collect { } }
-        subscribed.await()
+        watchScope = this
+        attachCompletionWatcher()
 
         val terminal = try {
             sequence(image)
         } finally {
-            completionWatcher.cancel()
+            completionWatcher?.cancel()
+            completionWatcher = null
+            watchScope = null
         }
         _phase.value = terminal
         terminal
@@ -158,7 +175,7 @@ class TandemFotaSession(
         }
 
         // 6. Install.
-        return awaitInstall(requiredTimeSec)
+        return awaitInstall(requiredTimeSec, image)
     }
 
     /** Returns a terminal phase on failure, or null when the step succeeded. */
@@ -284,7 +301,7 @@ class TandemFotaSession(
                     }
                     val end = minOf(offset + maxPacketSize, size)
                     val chunk = image.bytes.copyOfRange(offset, end)
-                    val sent = client.sendReliable(
+                    val sent = current.sendReliable(
                         SonyFrame.TYPE_LARGE_DATA_MDR,
                         UpdtMessages.transferData(offset, chunk),
                         SonyProtocolClient.LARGE_ACK_TIMEOUT_MS,
@@ -297,7 +314,8 @@ class TandemFotaSession(
                         )
                     }
                     offset = end
-                    _phase.value = FotaPhase.Transferring(offset * 100 / size)
+                    // Long math: offset * 100 overflows an Int past ~21 MB.
+                    _phase.value = FotaPhase.Transferring((offset.toLong() * 100 / size).toInt())
                 }
                 null
             } finally {
@@ -375,11 +393,12 @@ class TandemFotaSession(
     }
 
     /**
-     * Wait out the install. The device may reboot and drop the link here, which
-     * is NOT a failure: [SonyProtocolClient.notifications] keeps delivering
-     * once it returns, so we simply keep waiting until the deadline.
+     * Wait out the install. The device reboots here and the RFCOMM link dies,
+     * which is NOT a failure (spec-tandem-fota §4.7): with a [reconnect] we
+     * redial until the device answers again, otherwise we keep waiting on the
+     * old link. Either way the wait is bounded by 2 x requiredTime.
      */
-    private suspend fun awaitInstall(requiredTimeSec: Int): FotaPhase = coroutineScope {
+    private suspend fun awaitInstall(requiredTimeSec: Int, image: FirmwareImage): FotaPhase = coroutineScope {
         val deadlineMs = maxOf(MIN_INSTALL_TIMEOUT_MS, requiredTimeSec * 2 * 1000L)
         _phase.value = FotaPhase.Installing(0, requiredTimeSec)
 
@@ -397,16 +416,72 @@ class TandemFotaSession(
             }
         }
 
-        // The run-scoped watcher owns the subscription, so no completion can be
-        // missed between steps and a closed connection changes nothing here.
-        val done = withTimeoutOrNull(deadlineMs) { completed.first { it } }
-        ticker.cancel()
-
-        if (done != null) {
-            FotaPhase.Completed
-        } else {
-            FotaPhase.Failed(FotaFailure.TIMEOUT, "install not confirmed")
+        val done = try {
+            withTimeoutOrNull(deadlineMs) { installLoop(image) }
+        } finally {
+            ticker.cancel()
         }
+
+        done ?: FotaPhase.Failed(FotaFailure.TIMEOUT, "install not confirmed")
+    }
+
+    /**
+     * Race the completion notification against the link dying. On a drop with no
+     * [reconnect] we simply keep waiting (the caller's timeout bounds it); with
+     * one we redial every [RECONNECT_DELAY_MS] and resume watching the fresh
+     * session. Returns only on completion; the caller's timeout does the rest.
+     */
+    private suspend fun installLoop(image: FirmwareImage): FotaPhase {
+        while (true) {
+            if (awaitCompletionOrDrop()) return FotaPhase.Completed
+            val redial = reconnect ?: run {
+                completed.first { it }
+                return FotaPhase.Completed
+            }
+            while (true) {
+                delay(RECONNECT_DELAY_MS)
+                val fresh = redial() ?: continue
+                switchTo(fresh)
+                // A fresh session may never see FW_UPDATE_COMPLETED: the device
+                // sent it (if at all) on the link it dropped. The version it
+                // now reports is the authoritative answer.
+                if (fresh.firmwareVersion.value == image.version) return FotaPhase.Completed
+                break
+            }
+        }
+    }
+
+    /** True when the completion landed, false when the link dropped first. */
+    private suspend fun awaitCompletionOrDrop(): Boolean = coroutineScope {
+        val done = async { completed.first { it } }
+        val dropped = async { current.connected.first { !it } }
+        try {
+            select {
+                done.onAwait { true }
+                dropped.onAwait { false }
+            }
+        } finally {
+            done.cancel()
+            dropped.cancel()
+        }
+    }
+
+    /** Point the session at a post-reboot client and re-arm the completion watcher. */
+    private suspend fun switchTo(fresh: SonyProtocolClient) {
+        current = fresh
+        attachCompletionWatcher()
+    }
+
+    /**
+     * (Re-)subscribe the session-wide FW_UPDATE_COMPLETED watcher to [current].
+     * Returns once the subscription is live.
+     */
+    private suspend fun attachCompletionWatcher() {
+        val scope = watchScope ?: return
+        completionWatcher?.cancel()
+        val subscribed = CompletableDeferred<Unit>()
+        completionWatcher = scope.launch { notifies(subscribed).collect { } }
+        subscribed.await()
     }
 
     // ---- Cancel steps -----------------------------------------------------
@@ -480,7 +555,7 @@ class TandemFotaSession(
      * (the flow has no replay buffer).
      */
     private fun notifies(subscribed: CompletableDeferred<Unit>) =
-        client.notifications
+        current.notifications
             .onSubscription { subscribed.complete(Unit) }
             .mapNotNull { UpdtMessages.parseNotify(it.payload) }
             .onEach { if (it is UpdtNotify.Completed) completed.value = true }
@@ -488,6 +563,10 @@ class TandemFotaSession(
     /**
      * Subscribe, [trigger] the send, then feed each notification to [reduce]
      * until it returns non-null. Returns null on timeout or a failed send.
+     *
+     * The timeout window opens only after [trigger] returns: the send itself
+     * carries an Ack timeout plus resends, and spending that budget must not
+     * eat into the device's time to answer.
      */
     private suspend fun awaitStep(
         timeoutMs: Long,
@@ -495,21 +574,19 @@ class TandemFotaSession(
         reduce: (UpdtNotify) -> StepOutcome?,
     ): StepOutcome? = coroutineScope {
         val subscribed = CompletableDeferred<Unit>()
-        val waiter = async {
-            withTimeoutOrNull(timeoutMs) {
-                notifies(subscribed).mapNotNull { reduce(it) }.first()
-            }
-        }
+        val waiter = async { notifies(subscribed).mapNotNull { reduce(it) }.first() }
         subscribed.await()
         if (!trigger()) {
             waiter.cancel()
             return@coroutineScope null
         }
-        waiter.await()
+        val outcome = withTimeoutOrNull(timeoutMs) { waiter.await() }
+        if (outcome == null) waiter.cancel()
+        outcome
     }
 
     private suspend fun sendControl(payload: ByteArray): Boolean {
-        val ok = client.sendReliable(
+        val ok = current.sendReliable(
             SonyFrame.TYPE_COMMAND1,
             payload,
             SonyProtocolClient.CONTROL_ACK_TIMEOUT_MS,
@@ -538,5 +615,8 @@ class TandemFotaSession(
         const val START_TRANSFER_TIMEOUT_MS = 150_000L
         const val MIN_INSTALL_TIMEOUT_MS = 60_000L
         const val MIN_INSTALL_TICK_MS = 100L
+
+        /** Wait between redial attempts while the device is rebooting (§4.7). */
+        const val RECONNECT_DELAY_MS = 3000L
     }
 }

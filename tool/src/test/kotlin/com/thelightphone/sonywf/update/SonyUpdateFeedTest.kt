@@ -127,6 +127,23 @@ class SonyUpdateFeedTest {
     }
 
     @Test
+    fun `infoUrl rejects ids that are not safe path segments`() {
+        for (bad in listOf("", ".", "..", "a/b", "../etc", "a?b", "a b", "a%2Fb", "a#b")) {
+            assertFailsWith<FeedException>("categoryId '$bad'") {
+                SonyUpdateFeed.infoUrl(bad, serviceId)
+            }
+            assertFailsWith<FeedException>("serviceId '$bad'") {
+                SonyUpdateFeed.infoUrl(categoryId, bad)
+            }
+        }
+        // Dots, dashes and underscores are legal inside a segment.
+        assertEquals(
+            "https://info.update.sony.net/a.b-c_1/x.y/info/info.xml",
+            SonyUpdateFeed.infoUrl("a.b-c_1", "x.y"),
+        )
+    }
+
+    @Test
     fun `decodeInfo decrypts an AES SHA1 feed and strips zero padding`() {
         val info = SonyUpdateFeed.decodeInfo(feed(fullXml), categoryId, serviceId)
         assertEquals(DigestType.SHA1, info.digest)

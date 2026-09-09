@@ -1,6 +1,8 @@
 package com.thelightphone.sonywf.update
 
 import kotlin.coroutines.cancellation.CancellationException
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 
 /** Outcome of one update check. Network and feed failures surface as [Error]. */
 sealed interface UpdateCheck {
@@ -57,7 +59,11 @@ class FirmwareUpdateChecker(private val fetcher: HttpFetcher = HttpsUrlFetcher()
                 onProgress((received * 100 / expected).coerceIn(0L, 100L).toInt())
             }
         }
-        if (!SonyUpdateFeed.verifyBinary(bytes, update.sizeBytes, update.macHex, update.digest)) {
+        // Hashing several MB blocks; keep it off whatever thread called us.
+        val verified = withContext(Dispatchers.Default) {
+            SonyUpdateFeed.verifyBinary(bytes, update.sizeBytes, update.macHex, update.digest)
+        }
+        if (!verified) {
             throw FeedException("firmware binary failed verification (size or MAC)")
         }
         return FirmwareImage(
