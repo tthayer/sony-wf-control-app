@@ -18,6 +18,7 @@ import com.thelightphone.sdk.LightScreen
 import com.thelightphone.sdk.SealedLightActivity
 import com.thelightphone.sdk.ui.LightBarButton
 import com.thelightphone.sdk.ui.LightBottomBar
+import com.thelightphone.sdk.ui.LightScrollView
 import com.thelightphone.sdk.ui.LightText
 import com.thelightphone.sdk.ui.LightTextVariant
 import com.thelightphone.sdk.ui.LightTheme
@@ -106,17 +107,25 @@ class SonyWfHomeScreen(sealedActivity: SealedLightActivity) :
         is FirmwareUpdateUi.Installing,
         is FirmwareUpdateUi.Completed,
         is FirmwareUpdateUi.Failed,
+        is FirmwareUpdateUi.Diagnostics,
         -> true
         else -> false
     }
 
     private fun updateButtons(update: FirmwareUpdateUi): List<LightBarButton> = when (update) {
+        // DIAG takes UPDATE's single slot on a device we cannot flash from here.
         is FirmwareUpdateUi.Available ->
             if (update.installable) {
                 listOf(LightBarButton.Text(text = "UPDATE", onClick = viewModel::startUpdate))
             } else {
-                emptyList() // check-only device: nothing to press
+                listOf(LightBarButton.Text(text = "DIAG", onClick = viewModel::runAirohaDiagnostics))
             }
+        is FirmwareUpdateUi.Unsupported -> listOf(
+            LightBarButton.Text(text = "DIAG", onClick = viewModel::runAirohaDiagnostics),
+        )
+        is FirmwareUpdateUi.Diagnostics -> listOf(
+            LightBarButton.Text(text = "OK", onClick = viewModel::dismissDiagnostics),
+        )
         is FirmwareUpdateUi.Confirming -> listOf(
             LightBarButton.Text(text = "START", onClick = viewModel::confirmUpdate),
             LightBarButton.Text(text = "BACK", onClick = viewModel::cancelUpdate),
@@ -147,6 +156,12 @@ class SonyWfHomeScreen(sealedActivity: SealedLightActivity) :
 
     @Composable
     private fun ConnectedBody(s: SonyUiState.Connected) {
+        // The report is long raw hex, so it needs the whole body, not a line.
+        val update = s.update
+        if (update is FirmwareUpdateUi.Diagnostics) {
+            DiagnosticsBody(update.lines)
+            return
+        }
         Column(
             modifier = Modifier
                 .fillMaxSize()
@@ -223,6 +238,24 @@ class SonyWfHomeScreen(sealedActivity: SealedLightActivity) :
         }
     }
 
+    /** Raw DIAG report: smallest style, monospaced, scrollable, never truncated. */
+    @Composable
+    private fun DiagnosticsBody(lines: List<String>) {
+        LightScrollView(
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(horizontal = 1f.gridUnitsAsDp()),
+        ) {
+            for (line in lines) {
+                LightText(
+                    text = line,
+                    variant = LightTextVariant.Micro,
+                    monospace = true,
+                )
+            }
+        }
+    }
+
     /** One status line for the update flow; null when there is nothing to say. */
     private fun updateLine(update: FirmwareUpdateUi): String? = when (update) {
         is FirmwareUpdateUi.Unknown -> null
@@ -236,6 +269,7 @@ class SonyWfHomeScreen(sealedActivity: SealedLightActivity) :
         is FirmwareUpdateUi.Installing -> "Installing… keep the app open"
         is FirmwareUpdateUi.Completed -> "Update complete"
         is FirmwareUpdateUi.Failed -> update.message
+        is FirmwareUpdateUi.Diagnostics -> null // DiagnosticsBody owns the whole body
     }
 
     /** Secondary line: the non-installable route, and the pre-install warning. */

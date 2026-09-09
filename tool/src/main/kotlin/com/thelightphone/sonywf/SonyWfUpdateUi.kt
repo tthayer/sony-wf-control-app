@@ -30,4 +30,11 @@ sealed interface FirmwareUpdateUi {
     data class Completed(val version: String) : FirmwareUpdateUi
 
     data class Failed(val message: String) : FirmwareUpdateUi
+
+    /**
+     * Read-only Airoha RACE probe output, one report line per entry. Only
+     * reachable on devices we cannot flash from here (MTK / no update support),
+     * where it is the only way to learn the chip family and frame format.
+     */
+    data class Diagnostics(val lines: List<String>) : FirmwareUpdateUi
 }

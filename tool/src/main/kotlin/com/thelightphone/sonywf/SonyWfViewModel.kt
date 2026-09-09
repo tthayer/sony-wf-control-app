@@ -1,5 +1,6 @@
 package com.thelightphone.sonywf
 
+import android.util.Log
 import androidx.lifecycle.viewModelScope
 import com.thelightphone.sdk.LightViewModel
 import com.thelightphone.sdk.SimpleLightScreen
@@ -17,6 +18,8 @@ import com.thelightphone.sonywf.update.FotaPhase
 import com.thelightphone.sonywf.update.TandemFotaSession
 import com.thelightphone.sonywf.update.UpdateCheck
 import com.thelightphone.sonywf.update.UpdateParams
+import com.thelightphone.sonywf.update.airoha.AirohaDiagnostics
+import com.thelightphone.sonywf.update.airoha.RaceClient
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -84,6 +87,7 @@ class SonyWfViewModel(
     private var mirrorJob: Job? = null
     private var checkJob: Job? = null
     private var updateJob: Job? = null
+    private var diagJob: Job? = null
 
     /** Bluetooth name of the connected device; the feed model falls back to it. */
     private var deviceName: String = DEFAULT_DEVICE_NAME
@@ -99,6 +103,9 @@ class SonyWfViewModel(
     private var pendingUpdate: AvailableUpdate? = null
     private var pendingInstallable: Boolean = false
     private var fotaSession: TandemFotaSession? = null
+
+    /** Update state the DIAG report covered up, so OK can put it straight back. */
+    private var preDiagnostics: FirmwareUpdateUi? = null
 
     override fun onScreenShow(screen: SimpleLightScreen<Unit>) {
         hidden = false
@@ -359,6 +366,61 @@ class SonyWfViewModel(
         return protocol
     }
 
+    /**
+     * DIAG: one read-only Airoha RACE probe (docs/protocol/spec-airoha-fota.md
+     * §2, §3.7) on a SEPARATE secure RFCOMM socket, so nothing here touches the
+     * live Sony MDR link. Only offered where we cannot flash from here anyway:
+     * a check-only [FirmwareUpdateUi.Available] or [FirmwareUpdateUi.Unsupported].
+     *
+     * Every line is logged as well as shown: the report is the point of the run,
+     * and logcat survives the screen going away.
+     */
+    fun runAirohaDiagnostics() {
+        val current = _update.value
+        val eligible = (current is FirmwareUpdateUi.Available && !current.installable) ||
+            current is FirmwareUpdateUi.Unsupported
+        if (!eligible) return
+        if (diagJob?.isActive == true) return
+        val address = deviceAddress ?: return
+
+        preDiagnostics = current
+        diagJob = viewModelScope.launch {
+            _update.value = FirmwareUpdateUi.Diagnostics(listOf("probing…"))
+            var conn: LightSerialConnection? = null
+            var race: RaceClient? = null
+            val lines = try {
+                val opened = bluetooth.connect(address, UUID.fromString(AirohaDiagnostics.SPP_UUID))
+                conn = opened
+                val client = RaceClient(opened, viewModelScope)
+                race = client
+                client.start()
+                AirohaDiagnostics.run(client)
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                listOf("error: ${e.message ?: e.toString()}")
+            } finally {
+                race?.stop() // also closes the socket
+                runCatching { conn?.close() }
+            }
+            for (line in lines) Log.i(DIAG_TAG, line)
+            _update.value = FirmwareUpdateUi.Diagnostics(lines)
+        }
+    }
+
+    /** OK on the DIAG report: restore what it covered, or re-run the check. */
+    fun dismissDiagnostics() {
+        if (_update.value !is FirmwareUpdateUi.Diagnostics) return
+        diagJob?.cancel(); diagJob = null
+        val back = preDiagnostics
+        preDiagnostics = null
+        if (back != null && back !is FirmwareUpdateUi.Diagnostics) {
+            _update.value = back
+        } else {
+            recheck()
+        }
+    }
+
     /** CANCEL / BACK: abandon the confirmation, the download, or the transfer. */
     fun cancelUpdate() {
         when (_update.value) {
@@ -493,7 +555,9 @@ class SonyWfViewModel(
         connectJob?.cancel(); connectJob = null
         checkJob?.cancel(); checkJob = null
         updateJob?.cancel(); updateJob = null
+        diagJob?.cancel(); diagJob = null
         fotaSession = null
+        preDiagnostics = null
         pendingUpdate = null
         pendingInstallable = false
         _update.value = FirmwareUpdateUi.Unknown
@@ -523,5 +587,8 @@ class SonyWfViewModel(
 
         /** start() populates these before returning; this only guards a silent device. */
         private const val UPDATE_INPUTS_TIMEOUT_MS = 5_000L
+
+        /** Logcat tag for the read-only Airoha probe report. */
+        private const val DIAG_TAG = "SonyWfDiag"
     }
 }
