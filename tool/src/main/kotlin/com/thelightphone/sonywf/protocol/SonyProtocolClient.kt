@@ -1,11 +1,19 @@
 package com.thelightphone.sonywf.protocol
 
 import com.thelightphone.sdk.bluetooth.LightSerialConnection
+import com.thelightphone.sonywf.update.FirmwareUpdateMethod
+import com.thelightphone.sonywf.update.FirmwareUpdateMethods
+import com.thelightphone.sonywf.update.UpdateCapability
+import com.thelightphone.sonywf.update.UpdateParams
+import com.thelightphone.sonywf.update.UpdtMessages
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
@@ -62,6 +70,32 @@ class SonyProtocolClient(
     private val _firmwareVersion = MutableStateFlow<String?>(null)
     val firmwareVersion: StateFlow<String?> = _firmwareVersion.asStateFlow()
 
+    private val _modelName = MutableStateFlow<String?>(null)
+    /** Device-reported model name (V2 only); null until discovered. */
+    val modelName: StateFlow<String?> = _modelName.asStateFlow()
+
+    private val _supportFunctions = MutableStateFlow<Set<Int>?>(null)
+    /** Table-1 support-function bytes; null until discovered, always null on V1. */
+    val supportFunctions: StateFlow<Set<Int>?> = _supportFunctions.asStateFlow()
+
+    private val _updateMethod = MutableStateFlow<FirmwareUpdateMethod?>(null)
+    /** Firmware-update transport; null until known, [FirmwareUpdateMethod.NONE] on V1. */
+    val updateMethod: StateFlow<FirmwareUpdateMethod?> = _updateMethod.asStateFlow()
+
+    private val _updateCapability = MutableStateFlow<UpdateCapability?>(null)
+    val updateCapability: StateFlow<UpdateCapability?> = _updateCapability.asStateFlow()
+
+    private val _updateParams = MutableStateFlow<UpdateParams?>(null)
+    val updateParams: StateFlow<UpdateParams?> = _updateParams.asStateFlow()
+
+    private val _notifications = MutableSharedFlow<SonyMessage>(replay = 0, extraBufferCapacity = 256)
+    /**
+     * Every inbound Command1/Command2 message, emitted before the auto-Ack.
+     * The FOTA state machine drives itself off this: it survives a connection
+     * close (the flow never completes), which is required during install.
+     */
+    val notifications: SharedFlow<SonyMessage> = _notifications.asSharedFlow()
+
     // ---- Internal state ----------------------------------------------------
 
     private val decoder = SonyFrameDecoder()
@@ -82,6 +116,13 @@ class SonyProtocolClient(
     /** Opcode the inbound loop should match to complete [pendingQuery]. */
     @Volatile
     private var pendingQueryOpcode: Int = -1
+
+    /**
+     * Optional `payload[1]` the reply must also carry. Needed because opcode
+     * 0x05 answers both the firmware-version and the model-name query.
+     */
+    @Volatile
+    private var pendingQuerySub: Int = -1
 
     /** Completed by the inbound loop when a reply with [pendingQueryOpcode] arrives. */
     @Volatile
@@ -153,6 +194,11 @@ class SonyProtocolClient(
         discoverBattery(detected)
         discoverAnc(detected)
         discoverFirmware()
+        if (detected == SonyDialect.V2) {
+            discoverUpdateSupport()
+        } else {
+            _updateMethod.value = FirmwareUpdateMethod.NONE // v1 never speaks Tandem FOTA
+        }
     }
 
     /** Cancel the inbound collector and close the transport. Idempotent. */
@@ -208,8 +254,48 @@ class SonyProtocolClient(
 
     /** Best-effort firmware fetch; ignores absence of a reply. */
     private suspend fun discoverFirmware() {
-        val reply = query(SonyCommands.firmwareGet(), SonyResponses.FIRMWARE_RET)
+        val reply = query(
+            SonyCommands.firmwareGet(),
+            SonyResponses.FIRMWARE_RET,
+            replySub = SonyCommands.FIRMWARE_SUB,
+        )
         reply?.let { SonyResponses.parseFirmware(it.payload)?.let { fw -> _firmwareVersion.value = fw } }
+    }
+
+    /**
+     * V2-only firmware-update discovery: model name, support-function table,
+     * then (if the device advertises any update function) the FOTA capability
+     * and params for the selected inquired type. Every reply is best-effort —
+     * a missing one leaves its flow null and does NOT fail [start].
+     *
+     * The flows are populated by the inbound loop ([applyEvent]) so unsolicited
+     * copies of the same messages keep them current too.
+     */
+    private suspend fun discoverUpdateSupport() {
+        query(
+            SonyCommands.modelNameGet(),
+            SonyResponses.FIRMWARE_RET,
+            replySub = SonyCommands.DEVICE_INFO_MODEL_SUB,
+            timeoutMs = CONTROL_REPLY_TIMEOUT_MS,
+        )
+        query(
+            SonyCommands.supportFunctionGet(),
+            SonyResponses.SUPPORT_FUNCTION_RET,
+            timeoutMs = CONTROL_REPLY_TIMEOUT_MS,
+        )
+
+        val fns = _supportFunctions.value ?: return
+        val inq = FirmwareUpdateMethods.updtInquiredType(fns) ?: return
+        query(
+            UpdtMessages.getCapability(inq),
+            UpdtMessages.UPDT_RET_CAPABILITY,
+            timeoutMs = CONTROL_REPLY_TIMEOUT_MS,
+        )
+        query(
+            UpdtMessages.getParam(inq),
+            UpdtMessages.UPDT_RET_PARAM,
+            timeoutMs = CONTROL_REPLY_TIMEOUT_MS,
+        )
     }
 
     // ---- Commands ----------------------------------------------------------
@@ -233,37 +319,70 @@ class SonyProtocolClient(
     // ---- Send / receive plumbing ------------------------------------------
 
     /**
+     * Write a frame with the current [seq] and wait for its Ack; on timeout
+     * resend the IDENTICAL frame (same seq, per spec-tandem-fota §1.3) up to
+     * [maxResends] times. Returns false if no Ack ever arrived.
+     *
+     * Serialised by [sendMutex] so only one frame is ever outstanding
+     * (stop-and-wait, window size 1). A transport write failure counts as a
+     * failed attempt rather than propagating: callers decide what a dead link
+     * means, and the FOTA install phase expects the link to drop.
+     */
+    suspend fun sendReliable(type: Int, payload: ByteArray, ackTimeoutMs: Long, maxResends: Int): Boolean =
+        sendMutex.withLock {
+            // Encode once so every resend is byte-identical, seq included.
+            val frame = SonyFrame.encode(type, seq, payload)
+            var attempt = 0
+            while (attempt <= maxResends) {
+                val ack = CompletableDeferred<Unit>()
+                pendingAck = ack
+                val written = try {
+                    connection.write(frame)
+                    true
+                } catch (_: Exception) {
+                    false
+                }
+                val acked = if (written) withTimeoutOrNull(ackTimeoutMs) { ack.await() } != null else null
+                if (pendingAck === ack) pendingAck = null // clear on timeout / failure
+                if (acked == true) return@withLock true
+                attempt++
+            }
+            false
+        }
+
+    /**
      * Encode and write a command with the current [seq], then wait for its Ack
-     * before returning. Serialised by [sendMutex] so only one command is ever
-     * outstanding. Times out after [ACK_TIMEOUT_MS] so a lost Ack cannot wedge
-     * the driver forever.
+     * before returning. Times out after [ACK_TIMEOUT_MS] so a lost Ack cannot
+     * wedge the driver forever; no resend, matching the pre-FOTA behaviour.
      */
     private suspend fun sendCommand(type: Int, payload: ByteArray) {
-        sendMutex.withLock {
-            val ack = CompletableDeferred<Unit>()
-            pendingAck = ack
-            connection.write(SonyFrame.encode(type, seq, payload))
-            withTimeoutOrNull(ACK_TIMEOUT_MS) { ack.await() }
-            if (pendingAck === ack) pendingAck = null // clear on timeout
-        }
+        sendReliable(type, payload, ACK_TIMEOUT_MS, maxResends = 0)
     }
 
     /**
      * Send a command (awaiting its Ack) and then await a reply whose opcode is
-     * [replyOpcode], up to [REPLY_TIMEOUT_MS]. Returns the reply message, or null
-     * if none arrived in time. The pending-reply slot is registered BEFORE the
-     * command is written so a fast reply cannot be missed.
+     * [replyOpcode] (and, when given, whose `payload[1]` is [replySub]), up to
+     * [timeoutMs]. Returns the reply message, or null if none arrived in time.
+     * The pending-reply slot is registered BEFORE the command is written so a
+     * fast reply cannot be missed.
      */
-    private suspend fun query(payload: ByteArray, replyOpcode: Int): SonyMessage? {
+    private suspend fun query(
+        payload: ByteArray,
+        replyOpcode: Int,
+        replySub: Int = -1,
+        timeoutMs: Long = REPLY_TIMEOUT_MS,
+    ): SonyMessage? {
         val deferred = CompletableDeferred<SonyMessage>()
         pendingQueryOpcode = replyOpcode
+        pendingQuerySub = replySub
         pendingQuery = deferred
         return try {
             sendCommand(SonyFrame.TYPE_COMMAND1, payload)
-            withTimeoutOrNull(REPLY_TIMEOUT_MS) { deferred.await() }
+            withTimeoutOrNull(timeoutMs) { deferred.await() }
         } finally {
             pendingQuery = null
             pendingQueryOpcode = -1
+            pendingQuerySub = -1
         }
     }
 
@@ -286,6 +405,8 @@ class SonyProtocolClient(
                 val payload = message.payload
                 val opcode = if (payload.isNotEmpty()) payload[0].toInt() and 0xFF else -1
 
+                _notifications.tryEmit(message)
+
                 if (opcode == SonyResponses.INIT_REPLY_MARKER) {
                     val d = pendingInitReply
                     if (d != null && !d.isCompleted) d.complete(message)
@@ -294,17 +415,26 @@ class SonyProtocolClient(
                 }
 
                 // Complete an outstanding reply query, if this matches.
-                if (opcode != -1 && opcode == pendingQueryOpcode) {
+                val subMatches = pendingQuerySub == -1 ||
+                    (payload.size >= 2 && (payload[1].toInt() and 0xFF) == pendingQuerySub)
+                if (opcode != -1 && opcode == pendingQueryOpcode && subMatches) {
                     val q = pendingQuery
                     pendingQuery = null
                     pendingQueryOpcode = -1
+                    pendingQuerySub = -1
                     q?.complete(message)
                 }
 
                 // Auto-Ack every device Command1/Command2 with seq = (1 - msg.seq).
+                // A dead link must not tear the driver down: the FOTA install
+                // phase expects to keep receiving after the socket drops.
                 val ackSeq = (1 - message.seq) and 0xFF
                 scope.launch {
-                    connection.write(SonyFrame.encode(SonyFrame.TYPE_ACK, ackSeq, EMPTY_PAYLOAD))
+                    try {
+                        connection.write(SonyFrame.encode(SonyFrame.TYPE_ACK, ackSeq, EMPTY_PAYLOAD))
+                    } catch (_: Exception) {
+                        // ignored: nothing to do about an un-Ackable notification
+                    }
                 }
             }
         }
@@ -340,15 +470,49 @@ class SonyProtocolClient(
             is SonyEvent.Firmware -> {
                 _firmwareVersion.value = event.version
             }
-            null -> Unit
+            is SonyEvent.ModelName -> {
+                _modelName.value = event.name
+            }
+            is SonyEvent.SupportFunctions -> {
+                _supportFunctions.value = event.functions
+                _updateMethod.value = FirmwareUpdateMethods.fromSupportFunctions(event.functions)
+            }
+            null -> applyUpdtEvent(message)
         }
     }
 
-    private companion object {
-        const val INIT_RETRY_MS = 1500L
-        const val INIT_MAX_ATTEMPTS = 3
-        const val ACK_TIMEOUT_MS = 2000L
-        const val REPLY_TIMEOUT_MS = 1000L
-        val EMPTY_PAYLOAD = ByteArray(0)
+    /**
+     * UPDT replies the pure protocol parsers do not own (they live in the
+     * `update` package). Only the two cached-state messages are handled here;
+     * the FOTA state machine reads everything else off [notifications].
+     */
+    private fun applyUpdtEvent(message: SonyMessage) {
+        val payload = message.payload
+        when (if (payload.isNotEmpty()) payload[0].toInt() and 0xFF else -1) {
+            UpdtMessages.UPDT_RET_CAPABILITY ->
+                UpdtMessages.parseCapability(payload)?.let { _updateCapability.value = it }
+            UpdtMessages.UPDT_RET_PARAM ->
+                UpdtMessages.parseParam(payload)?.let { _updateParams.value = it }
+        }
+    }
+
+    companion object {
+        /** Ack timeout + resend budget for UPDT control frames (Command1). */
+        const val CONTROL_ACK_TIMEOUT_MS = 2000L
+        const val CONTROL_RESENDS = 3
+
+        /** Ack timeout + resend budget for firmware chunks (spec-tandem-fota §1.3). */
+        const val LARGE_ACK_TIMEOUT_MS = 5000L
+        const val LARGE_RESENDS = 2
+
+        private const val INIT_RETRY_MS = 1500L
+        private const val INIT_MAX_ATTEMPTS = 3
+        private const val ACK_TIMEOUT_MS = 2000L
+        private const val REPLY_TIMEOUT_MS = 1000L
+
+        /** Reply timeout for the slower device-info / UPDT discovery queries. */
+        private const val CONTROL_REPLY_TIMEOUT_MS = 2000L
+
+        private val EMPTY_PAYLOAD = ByteArray(0)
     }
 }

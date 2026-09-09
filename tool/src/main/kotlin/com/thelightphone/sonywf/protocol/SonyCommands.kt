@@ -68,6 +68,14 @@ object SonyCommands {
     const val FIRMWARE_GET = 0x04
     const val FIRMWARE_SUB = 0x02
 
+    // ---- Device info / support functions (V2 dialect only) -----------------
+
+    /** CONNECT_GET_SUPPORT_FUNCTION opcode. */
+    const val SUPPORT_FUNCTION_GET = 0x06
+
+    /** `FIRMWARE_GET` sub-byte that asks for the model name instead of the version. */
+    const val DEVICE_INFO_MODEL_SUB = 0x01
+
     /**
      * Battery types to probe, in order, for the given dialect. Devices silently
      * ignore unsupported types (there is no NAK in this protocol), so callers
@@ -184,4 +192,12 @@ object SonyCommands {
     /** `[0x04, 0x02]` — request the firmware version string (both dialects). */
     fun firmwareGet(): ByteArray =
         byteArrayOf(FIRMWARE_GET.toByte(), FIRMWARE_SUB.toByte())
+
+    /** `[0x06, 0x00]` — request the table-1 support-function list (V2 only). */
+    fun supportFunctionGet(): ByteArray =
+        byteArrayOf(SUPPORT_FUNCTION_GET.toByte(), 0x00)
+
+    /** `[0x04, 0x01]` — request the model-name string (V2 only). */
+    fun modelNameGet(): ByteArray =
+        byteArrayOf(FIRMWARE_GET.toByte(), DEVICE_INFO_MODEL_SUB.toByte())
 }

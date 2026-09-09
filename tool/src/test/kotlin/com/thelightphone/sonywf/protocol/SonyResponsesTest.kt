@@ -253,6 +253,53 @@ class SonyCommandsAndResponsesTest {
         assertNull(SonyResponses.parseFirmware(bytes(0x99, 0x02, 0x01, 0x31))) // wrong opcode
     }
 
+    @Test
+    fun firmwareParserIgnoresModelNameReply() {
+        // 0x05 carries the model name on sub 0x01 and the version on sub 0x02;
+        // the firmware parser must not claim the former.
+        assertNull(SonyResponses.parseFirmware(bytes(0x05, 0x01, 0x03, 0x41, 0x42, 0x43)))
+        assertEquals("ABC", SonyResponses.parseModelName(bytes(0x05, 0x01, 0x03, 0x41, 0x42, 0x43)))
+    }
+
+    // ---- Model name --------------------------------------------------------
+
+    @Test
+    fun parseModelNameAscii() {
+        assertEquals(
+            "WF-1000XM5",
+            SonyResponses.parseModelName(bytes(0x05, 0x01, 0x0a) + "WF-1000XM5".toByteArray(Charsets.US_ASCII)),
+        )
+        assertNull(SonyResponses.parseModelName(bytes(0x05, 0x02, 0x03, 0x31, 0x2e, 0x32))) // firmware reply
+        assertNull(SonyResponses.parseModelName(bytes(0x05, 0x01))) //                        too short
+        assertNull(SonyResponses.parseModelName(bytes(0x05, 0x01, 0x00))) //                  empty name
+    }
+
+    @Test
+    fun modelNameGetAndSupportFunctionGetEncoding() {
+        assertContentEquals(bytes(0x04, 0x01), SonyCommands.modelNameGet())
+        assertContentEquals(bytes(0x06, 0x00), SonyCommands.supportFunctionGet())
+    }
+
+    // ---- Support functions -------------------------------------------------
+
+    @Test
+    fun parseSupportFunctionsReadsFunctionBytesAndDropsNoUse() {
+        // 07 00 count=3 { 0x30,cap } { 0x00,cap } { 0x22,cap }
+        assertEquals(
+            setOf(0x30, 0x22),
+            SonyResponses.parseSupportFunctions(bytes(0x07, 0x00, 0x03, 0x30, 0x01, 0x00, 0x00, 0x22, 0x02)),
+        )
+        assertEquals(emptySet(), SonyResponses.parseSupportFunctions(bytes(0x07, 0x00, 0x00)))
+    }
+
+    @Test
+    fun parseSupportFunctionsRejectsLengthMismatch() {
+        assertNull(SonyResponses.parseSupportFunctions(bytes(0x07, 0x00, 0x02, 0x30, 0x01))) //       short
+        assertNull(SonyResponses.parseSupportFunctions(bytes(0x07, 0x00, 0x01, 0x30, 0x01, 0x00))) // long
+        assertNull(SonyResponses.parseSupportFunctions(bytes(0x07, 0x00))) //                         truncated
+        assertNull(SonyResponses.parseSupportFunctions(bytes(0x06, 0x00, 0x00))) //                   wrong opcode
+    }
+
     // ---- Dispatcher --------------------------------------------------------
 
     @Test
@@ -271,6 +318,31 @@ class SonyCommandsAndResponsesTest {
         assertNull(SonyResponses.parse(SonyDialect.V2, SonyMessage(SonyFrame.TYPE_COMMAND1, 0, bytes(0x13, 0x00, 10, 0x00))))
         // ...but IS recognised under V1.
         assertTrue(SonyResponses.parse(SonyDialect.V1, SonyMessage(SonyFrame.TYPE_COMMAND1, 0, bytes(0x13, 0x00, 10, 0x00))) is SonyEvent.Battery)
+    }
+
+    @Test
+    fun dispatcherRoutesModelNameAndSupportFunctions() {
+        val model = SonyResponses.parse(
+            SonyDialect.V2,
+            SonyMessage(SonyFrame.TYPE_COMMAND1, 0, bytes(0x05, 0x01, 0x02, 0x48, 0x50)),
+        )
+        assertTrue(model is SonyEvent.ModelName)
+        assertEquals("HP", (model as SonyEvent.ModelName).name)
+
+        val fns = SonyResponses.parse(
+            SonyDialect.V2,
+            SonyMessage(SonyFrame.TYPE_COMMAND1, 0, bytes(0x07, 0x00, 0x01, 0x30, 0x00)),
+        )
+        assertTrue(fns is SonyEvent.SupportFunctions)
+        assertEquals(setOf(0x30), (fns as SonyEvent.SupportFunctions).functions)
+
+        // Still routes the version reply to Firmware.
+        assertTrue(
+            SonyResponses.parse(
+                SonyDialect.V2,
+                SonyMessage(SonyFrame.TYPE_COMMAND1, 0, bytes(0x05, 0x02, 0x03, 0x31, 0x2e, 0x32)),
+            ) is SonyEvent.Firmware,
+        )
     }
 
     @Test
