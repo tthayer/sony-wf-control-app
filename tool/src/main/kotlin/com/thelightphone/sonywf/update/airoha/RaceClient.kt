@@ -36,10 +36,14 @@ import kotlinx.coroutines.withTimeoutOrNull
  * @param connection live byte transport on the Airoha SPP socket.
  * @param scope owns the inbound collector; cancelling it (or [stop]) tears the
  *   driver down.
+ * @param trace when set, every TX/RX frame is logged as hex EXCEPT 0x0402 page
+ *   writes and their acks: a real image is tens of thousands of those, which
+ *   would bury every frame worth reading.
  */
 class RaceClient(
     private val connection: LightSerialConnection,
     private val scope: CoroutineScope,
+    private val trace: ((String) -> Unit)? = null,
 ) {
     private val _connected = MutableStateFlow(false)
     /** True from [start] until the inbound stream completes or [stop] runs. */
@@ -66,7 +70,10 @@ class RaceClient(
         receiveJob = scope.launch {
             try {
                 connection.incoming.collect { chunk ->
-                    for (message in decoder.feed(chunk)) _messages.tryEmit(message)
+                    for (message in decoder.feed(chunk)) {
+                        if (message.raceId != AirohaRace.WRITE_FLASH) trace?.invoke("rx ${message.hex}")
+                        _messages.tryEmit(message)
+                    }
                 }
             } finally {
                 _connected.value = false
@@ -126,6 +133,7 @@ class RaceClient(
      * when the transport write failed.
      */
     suspend fun writeRaw(bytes: ByteArray): Boolean = sendMutex.withLock {
+        traceTx(bytes)
         try {
             connection.write(bytes)
             true
@@ -168,6 +176,7 @@ class RaceClient(
                 }
             }
         }
+        traceTx(frame)
         val written = try {
             connection.write(frame)
             true
@@ -183,6 +192,20 @@ class RaceClient(
             return@coroutineScope null
         }
         awaiting.await()
+    }
+
+    /**
+     * Log one outbound write. The race id is read from the FIRST frame in the
+     * buffer: a long packet concatenates only 0x0402 commands, so that is enough
+     * to recognise (and skip) the page-write flood.
+     */
+    private fun traceTx(bytes: ByteArray) {
+        val log = trace ?: return
+        if (bytes.size >= RaceFrame.HEADER_SIZE) {
+            val raceId = (bytes[4].toInt() and 0xFF) or ((bytes[5].toInt() and 0xFF) shl 8)
+            if (raceId == AirohaRace.WRITE_FLASH) return
+        }
+        log("tx " + bytes.joinToString(" ") { "%02x".format(it) })
     }
 
     companion object {

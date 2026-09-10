@@ -41,9 +41,14 @@ internal class AirohaDeviceConfig(
     val onCommand: (Int) -> Unit = {},
     /** When false 0x1C06 is acked but the state does not move, so the final 0x1C04 disagrees. */
     val honourStateWrites: Boolean = true,
-    /** Commit reboots the device: the socket dies with no reply. */
-    val closeOnCommit: Boolean = true,
+    /**
+     * Frame type of the 0x1C02 reply, or null for no reply at all. A real
+     * WH-1000XM5 answers 0x5B and then reboots, which is the default here.
+     */
+    val commitReplyType: Int? = RaceFrame.TYPE_RSP,
     val commitStatus: Int = 0,
+    /** The reboot kills the RACE socket, after (or instead of) the reply. */
+    val closeOnCommit: Boolean = true,
     /** Fired when 0x1C02 lands, to model the reboot killing the MDR link too. */
     val onCommit: () -> Unit = {},
 )
@@ -287,11 +292,10 @@ internal class FakeAirohaFotaDevice(
 
             AirohaRace.COMMIT -> {
                 config.onCommit()
-                if (config.closeOnCommit) {
-                    socket?.close()
-                } else {
-                    reply(RaceFrame.TYPE_CMD, message.raceId, byteArrayOf(config.commitStatus.toByte()))
+                config.commitReplyType?.let {
+                    reply(it, message.raceId, byteArrayOf(config.commitStatus.toByte()))
                 }
+                if (config.closeOnCommit) socket?.close()
             }
 
             AirohaRace.CANCEL -> {

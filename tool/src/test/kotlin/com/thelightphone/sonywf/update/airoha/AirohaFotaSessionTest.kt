@@ -110,34 +110,67 @@ class AirohaFotaSessionTest {
     }
 
     @Test
-    fun commitSucceedsWhenTheSocketDrops() = runTest {
-        val device = FakeAirohaFotaDevice(AirohaDeviceConfig(closeOnCommit = true))
+    fun commitIsAcceptedWhenTheSocketDropsWithNoReply() = runTest {
+        val device = FakeAirohaFotaDevice(AirohaDeviceConfig(commitReplyType = null, closeOnCommit = true))
         val race = RaceClient(device.openSocket(), backgroundScope)
         race.start()
         runCurrent()
 
-        assertTrue(AirohaFotaSession(race) { currentTime }.commit())
+        assertEquals(CommitOutcome.Accepted(disconnected = true), AirohaFotaSession(race) { currentTime }.commit())
         assertFalse(device.isConnected)
     }
 
     @Test
-    fun commitSucceedsOnAStatusZeroReply() = runTest {
-        val device = FakeAirohaFotaDevice(AirohaDeviceConfig(closeOnCommit = false, commitStatus = 0))
+    fun commitIsAcceptedOnA0x5BReplyFollowedByTheDrop() = runTest {
+        // What a real MT2822S does: 0x5B status 0, then the reboot kills the socket.
+        val device = FakeAirohaFotaDevice(
+            AirohaDeviceConfig(commitReplyType = RaceFrame.TYPE_RSP, closeOnCommit = true),
+        )
         val race = RaceClient(device.openSocket(), backgroundScope)
         race.start()
         runCurrent()
 
-        assertTrue(AirohaFotaSession(race) { currentTime }.commit())
+        assertEquals(CommitOutcome.Accepted(disconnected = true), AirohaFotaSession(race) { currentTime }.commit())
+        assertTrue(device.cancels.isEmpty())
     }
 
     @Test
-    fun commitFailsOnANonZeroStatus() = runTest {
-        val device = FakeAirohaFotaDevice(AirohaDeviceConfig(closeOnCommit = false, commitStatus = 3))
+    fun commitIsAcceptedWhenTheSocketNeverDrops() = runTest {
+        val device = FakeAirohaFotaDevice(
+            AirohaDeviceConfig(commitReplyType = RaceFrame.TYPE_RSP, closeOnCommit = false),
+        )
         val race = RaceClient(device.openSocket(), backgroundScope)
         race.start()
         runCurrent()
 
-        assertFalse(AirohaFotaSession(race) { currentTime }.commit())
+        // The drop is reported, never required: the device is committed either way.
+        assertEquals(CommitOutcome.Accepted(disconnected = false), AirohaFotaSession(race) { currentTime }.commit())
+        assertTrue(device.isConnected)
+    }
+
+    @Test
+    fun commitIsRefusedOnANonZeroStatus() = runTest {
+        val device = FakeAirohaFotaDevice(
+            AirohaDeviceConfig(commitReplyType = RaceFrame.TYPE_CMD, commitStatus = 3, closeOnCommit = false),
+        )
+        val race = RaceClient(device.openSocket(), backgroundScope)
+        race.start()
+        runCurrent()
+
+        val session = AirohaFotaSession(race) { currentTime }
+        assertEquals(CommitOutcome.Refused(3), session.commit())
+        // A refusal must not abandon the image.
+        assertTrue(device.cancels.isEmpty())
+    }
+
+    @Test
+    fun commitReportsNoReplyWhenTheDeviceStaysSilentAndConnected() = runTest {
+        val device = FakeAirohaFotaDevice(AirohaDeviceConfig(commitReplyType = null, closeOnCommit = false))
+        val race = RaceClient(device.openSocket(), backgroundScope)
+        race.start()
+        runCurrent()
+
+        assertEquals(CommitOutcome.NoReply, AirohaFotaSession(race) { currentTime }.commit())
     }
 
     @Test

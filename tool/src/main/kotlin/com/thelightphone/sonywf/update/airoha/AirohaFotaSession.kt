@@ -16,6 +16,22 @@ import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.coroutines.yield
 
 /**
+ * How the device answered 0x1C02 Commit.
+ *
+ * The distinction matters for teardown: once a commit is [Accepted] the device
+ * is rebooting into the new image and nothing may send 0x1C03 at it, while a
+ * [Refused] commit leaves a complete image that a later commit can still take.
+ */
+sealed interface CommitOutcome {
+    /** @param disconnected the RACE socket dropped, i.e. the reboot was observed. */
+    data class Accepted(val disconnected: Boolean) : CommitOutcome
+
+    data class Refused(val status: Int) : CommitOutcome
+
+    data object NoReply : CommitOutcome
+}
+
+/**
  * The single-device (non-TWS) MediaTek/Airoha flash path: stages 1-14 of
  * spec-airoha-mt28xx-single §3.0, driven over an already-open [RaceClient].
  *
@@ -64,6 +80,10 @@ class AirohaFotaSession(
     /** True while [transfer] is running: only then may a stage failure cancel. */
     @Volatile
     private var flowActive = false
+
+    /** True once a commit was accepted: the device is rebooting, so never cancel. */
+    @Volatile
+    private var committed = false
 
     private var pacingMs = 0L
     private var commandsPerPacket = AirohaRace.COMMANDS_PER_PACKET_ACTIVE
@@ -259,23 +279,44 @@ class AirohaFotaSession(
     }
 
     /**
-     * 0x1C02 Commit (§4.1/§4.2). Success is a 0x5A reply with status 0 OR the
-     * socket dropping: the device reboots into the new image, and on that path
-     * no reply is ever seen.
+     * 0x1C02 Commit (§4.1/§4.2). Success is a status-0 reply of ANY frame type,
+     * or the socket dropping: the device reboots into the new image, and on that
+     * path no reply is ever seen.
+     *
+     * The library's `handleResp` for MT2822 matches a commit reply on the race id
+     * ALONE (`libfota1568/fota/stage/a.java:283-330`) and judges it by `rx[6]`,
+     * so a real MT2822S answering with a 0x5B is an acceptance, not noise. It
+     * then waits for the disconnect; a device that does not drop within
+     * [AirohaRace.COMMIT_DISCONNECT_WAIT_MS] is still committed, so the wait only
+     * reports what it saw.
+     *
+     * No resend: a second 0x1C02 at a device already rebooting is pointless.
      */
-    suspend fun commit(): Boolean {
+    suspend fun commit(): CommitOutcome {
         val rx = race.request(
             raceId = AirohaRace.COMMIT,
             payload = AirohaRequests.commit(),
             flag = txFlag(),
             timeoutMs = AirohaRace.TIMEOUT_MS,
             retries = 0,
-            acceptTypes = setOf(RaceFrame.TYPE_CMD),
+            acceptTypes = COMMIT_REPLY_TYPES,
             replyFlagMask = rxMask(),
         )
-        if (rx != null) return rx.rx(6) == 0
-        if (!race.connected.value) return true
-        return withTimeoutOrNull(AirohaRace.TIMEOUT_MS) { race.connected.first { !it } } != null
+        if (rx == null) {
+            if (!race.connected.value) return accepted(true)
+            return CommitOutcome.NoReply
+        }
+        val status = rx.rx(6)
+        if (status != 0) return CommitOutcome.Refused(status)
+        if (!race.connected.value) return accepted(true)
+        val dropped =
+            withTimeoutOrNull(AirohaRace.COMMIT_DISCONNECT_WAIT_MS) { race.connected.first { !it } } != null
+        return accepted(dropped)
+    }
+
+    private fun accepted(disconnected: Boolean): CommitOutcome {
+        committed = true
+        return CommitOutcome.Accepted(disconnected)
     }
 
     /**
@@ -284,6 +325,8 @@ class AirohaFotaSession(
      */
     suspend fun cancel(reason: Int) {
         cancelRequested = true
+        // A committed device is rebooting into the new image; 0x1C03 could abort it.
+        if (committed) return
         // Outside a run there is no FOTA state to abandon, so stay silent.
         if (!flowActive && !sessionOpen) return
         race.request(
@@ -671,5 +714,8 @@ class AirohaFotaSession(
 
         /** A 0x5D stage also has to hear a 0x5B refusal for the same race id. */
         val NOTIFY_OR_RSP = setOf(RaceFrame.TYPE_NOTIFY, RaceFrame.TYPE_RSP)
+
+        /** Commit is matched on the race id alone, so every type counts (§6.1). */
+        val COMMIT_REPLY_TYPES = setOf(RaceFrame.TYPE_CMD, RaceFrame.TYPE_RSP, RaceFrame.TYPE_NOTIFY)
     }
 }

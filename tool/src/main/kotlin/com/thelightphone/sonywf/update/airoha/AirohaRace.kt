@@ -85,6 +85,14 @@ object AirohaRace {
     /** The cancel stage overrides the timeout to 3000 ms (`f8/c.java:20`). */
     const val CANCEL_TIMEOUT_MS = 3000L
 
+    /**
+     * How long to wait for the reboot to drop the RACE socket after a commit was
+     * accepted. The library waits 15 s for that "disconnected event" (`u7/d.java`
+     * `w0()`); a real MT2822S can take longer, and the drop is informational
+     * only, so this is generous and never fatal.
+     */
+    const val COMMIT_DISCONNECT_WAIT_MS = 20_000L
+
     /** libcommon chip-name read: 1000 ms, `mMaxRetry = 2` => 3 sends (§1.3). */
     const val CHIP_NAME_TIMEOUT_MS = 1000L
     const val CHIP_NAME_ATTEMPTS = 3

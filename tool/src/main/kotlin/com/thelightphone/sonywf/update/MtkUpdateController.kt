@@ -5,6 +5,7 @@ import com.thelightphone.sonywf.protocol.SonyFrame
 import com.thelightphone.sonywf.protocol.SonyProtocolClient
 import com.thelightphone.sonywf.update.airoha.AirohaFotaSession
 import com.thelightphone.sonywf.update.airoha.AirohaRace
+import com.thelightphone.sonywf.update.airoha.CommitOutcome
 import com.thelightphone.sonywf.update.airoha.RaceClient
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
@@ -35,6 +36,9 @@ enum class AirohaChip { MT2811, MT2822, AB1562, MT2833, MT2855, UNKNOWN }
  *
  * @param openAiroha opens a secure RFCOMM socket to `AirohaDiagnostics.SPP_UUID`.
  * @param reconnect redials the MDR link after the reboot, or null if not yet up.
+ * @param trace when set, receives run milestones and (via [RaceClient]) every
+ *   RACE frame but the 0x0402 flood. A 25-minute flash is only debuggable from
+ *   a device log, so this is the only window into one.
  */
 class MtkUpdateController(
     private val client: SonyProtocolClient,
@@ -42,6 +46,7 @@ class MtkUpdateController(
     private val reconnect: suspend () -> SonyProtocolClient?,
     private val scope: CoroutineScope,
     private val clock: () -> Long = System::currentTimeMillis,
+    private val trace: ((String) -> Unit)? = null,
 ) {
     private val _phase = MutableStateFlow<FotaPhase>(FotaPhase.Idle)
     val phase: StateFlow<FotaPhase> = _phase.asStateFlow()
@@ -59,6 +64,18 @@ class MtkUpdateController(
     /** True once the first flash-writing stage could have run. */
     @Volatile
     private var transferBegan = false
+
+    /**
+     * True from the first 0x1C02 onwards. The image is complete by then, so even
+     * a refused commit must not be followed by 0x1C03: the library retries the
+     * commit instead, and a later attempt can still take the same image.
+     */
+    @Volatile
+    private var commitAttempted = false
+
+    /** True once a commit was accepted: the device is rebooting into the new image. */
+    @Volatile
+    private var committed = false
 
     private var inquiredType = -1
     private var race: RaceClient? = null
@@ -89,9 +106,13 @@ class MtkUpdateController(
 
     /** Best-effort return to a known state. Safe to call twice. */
     private suspend fun teardown() {
+        // A committed device is rebooting into the new image: neither 0x1C03 nor
+        // leaving update mode may reach it, or the reboot can be aborted.
+        if (committed) return
         // Only a transfer that started can have left FOTA state to abandon; the
-        // session itself stays silent when it never opened one.
-        if (transferBegan && race?.connected?.value == true) {
+        // session itself stays silent when it never opened one, and a commit that
+        // was merely refused leaves an image worth keeping.
+        if (transferBegan && !commitAttempted && race?.connected?.value == true) {
             session?.cancel(AirohaRace.CANCEL_REASON_STAGE_ERROR)
         }
         if (updateModeOn) {
@@ -149,6 +170,7 @@ class MtkUpdateController(
         probe.stop()
         race = null
         val chip = chipFamily(chipName)
+        trace?.invoke("chip ${chipName ?: "unknown"}")
         if (chip != AirohaChip.MT2822 && chip != AirohaChip.MT2833) {
             return FotaPhase.Failed(FotaFailure.OTHER, "unsupported chip: ${chipName ?: "unknown"} ($chip)")
         }
@@ -164,10 +186,12 @@ class MtkUpdateController(
         // Background transfer is a device-reported capability; Active otherwise.
         // MT2822/MT2833 never use Adaptive (spec §3.2).
         val mode = if (capability.backgroundTransfer) AirohaRace.MODE_BACKGROUND else AirohaRace.MODE_ACTIVE
+        trace?.invoke("mode 0x${"%02x".format(mode)}")
         transferBegan = true
         val transferred = fota.transfer(image.bytes, mode)
         mirror?.cancel()
         if (transferred !is FotaPhase.Transferring) return transferred
+        trace?.invoke("transfer done")
         if (cancelRequested) return FotaPhase.Cancelled
 
         // Sony re-asserts update mode before committing (`nu/o.java:894-905`).
@@ -175,9 +199,39 @@ class MtkUpdateController(
             return FotaPhase.Failed(FotaFailure.DEVICE_REFUSED, "UPDT_SET_STATUS enable not acked before commit")
         }
         _phase.value = FotaPhase.Executing
-        if (!fota.commit()) return FotaPhase.Failed(FotaFailure.OTHER, "commit refused")
+
+        commitAttempted = true
+        var outcome = fota.commit()
+        trace?.invoke(describe(outcome))
+        // A refusal is retried, exactly as the library retries COMMIT_FAIL: the
+        // written image is intact, so a second attempt costs nothing.
+        if (outcome is CommitOutcome.Refused) {
+            delay(COMMIT_RETRY_DELAY_MS)
+            outcome = fota.commit()
+            trace?.invoke(describe(outcome))
+        }
+        when (outcome) {
+            is CommitOutcome.Accepted -> {
+                committed = true
+                if (outcome.disconnected) trace?.invoke("socket dropped")
+                // Nothing else rides the RACE socket, and holding it open only
+                // gives the rebooting device a link to service.
+                race?.stop()
+            }
+            is CommitOutcome.Refused -> return FotaPhase.Failed(
+                FotaFailure.DEVICE_REFUSED,
+                "commit status 0x${"%02x".format(outcome.status)}",
+            )
+            CommitOutcome.NoReply -> return FotaPhase.Failed(FotaFailure.TIMEOUT, "no commit reply")
+        }
 
         return awaitInstall(image)
+    }
+
+    private fun describe(outcome: CommitOutcome): String = when (outcome) {
+        is CommitOutcome.Accepted -> "commit status 0x00"
+        is CommitOutcome.Refused -> "commit status 0x${"%02x".format(outcome.status)}"
+        CommitOutcome.NoReply -> "commit no reply"
     }
 
     /**
@@ -202,6 +256,7 @@ class MtkUpdateController(
             _phase.value = FotaPhase.Installing(percent, 0)
             val fresh = redial() ?: continue
             val version = fresh.firmwareVersion.value
+            trace?.invoke("redial ok version=$version")
             when {
                 version == image.version -> return FotaPhase.Completed
                 version == null || version == previousVersion -> continue
@@ -229,7 +284,7 @@ class MtkUpdateController(
         } catch (_: Exception) {
             return null
         }
-        val opened = RaceClient(connection, scope)
+        val opened = RaceClient(connection, scope, trace)
         opened.start()
         race = opened
         return opened
@@ -247,6 +302,9 @@ class MtkUpdateController(
         /** Reboot + reconnect budget (design §10.3). */
         const val INSTALL_TIMEOUT_MS = 480_000L
         const val RECONNECT_DELAY_MS = 3000L
+
+        /** Pause before the one commit retry, so the device can finish whatever refused it. */
+        const val COMMIT_RETRY_DELAY_MS = 2000L
 
         /** How long to wait for the reboot to drop the MDR link before polling. */
         const val LINK_DROP_WAIT_MS = 60_000L

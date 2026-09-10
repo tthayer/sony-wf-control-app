@@ -375,6 +375,9 @@ class SonyWfViewModel(
             openAiroha = { bluetooth.connect(address, UUID.fromString(AirohaDiagnostics.SPP_UUID)) },
             reconnect = { reconnectForUpdate() },
             scope = viewModelScope,
+            // A flash runs for ~25 min on real hardware; logcat is the only
+            // record of what the device actually answered.
+            trace = { Log.i("SonyWfFota", it) },
         )
         mtkController = controller
         val phaseMirror = launch {

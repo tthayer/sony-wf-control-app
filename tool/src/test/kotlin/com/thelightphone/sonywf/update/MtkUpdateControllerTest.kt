@@ -9,6 +9,7 @@ import com.thelightphone.sonywf.update.airoha.AirohaDeviceConfig
 import com.thelightphone.sonywf.update.airoha.AirohaRace
 import com.thelightphone.sonywf.update.airoha.FakeAirohaFotaDevice
 import com.thelightphone.sonywf.update.airoha.FlashPlan
+import com.thelightphone.sonywf.update.airoha.RaceFrame
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.receiveAsFlow
@@ -123,7 +124,7 @@ class MtkUpdateControllerTest {
             capability,
         )
 
-        // Committing reboots the headphone: both links die.
+        // Committing reboots the headphone: 0x5B status 0, then both links die.
         val airoha = FakeAirohaFotaDevice(AirohaDeviceConfig(onCommit = { mdr.close() }))
         val rebooted = FakeMdrConnection(firmwareVersion = "2.0.0")
         val freshClient = SonyProtocolClient(rebooted, backgroundScope)
@@ -165,6 +166,69 @@ class MtkUpdateControllerTest {
         assertTrue(airoha.badCrcPages.isEmpty())
         assertTrue(AirohaRace.COMMIT in airoha.commands)
         assertTrue(airoha.cancels.isEmpty())
+        advanceUntilIdle()
+    }
+
+    @Test
+    fun aCommitAcceptedWithoutASocketDropStillInstalls() = runTest {
+        val mdr = FakeMdrConnection(firmwareVersion = "1.0.0")
+        val client = SonyProtocolClient(mdr, backgroundScope)
+        client.start()
+        runCurrent()
+
+        // Status 0 but the RACE socket stays up: still committed, so the run
+        // must go on to wait for the reboot instead of failing.
+        val airoha = FakeAirohaFotaDevice(
+            AirohaDeviceConfig(closeOnCommit = false, onCommit = { mdr.close() }),
+        )
+        val rebooted = FakeMdrConnection(firmwareVersion = "2.0.0")
+        val freshClient = SonyProtocolClient(rebooted, backgroundScope)
+
+        val controller = MtkUpdateController(
+            client = client,
+            openAiroha = { airoha.openSocket() },
+            reconnect = {
+                freshClient.start()
+                freshClient
+            },
+            scope = backgroundScope,
+            clock = { currentTime },
+        )
+
+        val image = FirmwareImage(payload(2 * FlashPlan.PAGE), "2.0.0", "fw.bin", DigestType.NONE, "")
+        assertEquals(FotaPhase.Completed, controller.run(image, 0x04, client.updateCapability.value))
+        assertEquals(1, airoha.commands.count { it == AirohaRace.COMMIT })
+        assertTrue(airoha.cancels.isEmpty())
+        advanceUntilIdle()
+    }
+
+    @Test
+    fun aRefusedCommitIsRetriedThenFailsWithoutCancelling() = runTest {
+        val mdr = FakeMdrConnection(firmwareVersion = "1.0.0")
+        val client = SonyProtocolClient(mdr, backgroundScope)
+        client.start()
+        runCurrent()
+
+        val airoha = FakeAirohaFotaDevice(
+            AirohaDeviceConfig(commitReplyType = RaceFrame.TYPE_CMD, commitStatus = 3, closeOnCommit = false),
+        )
+        val controller = MtkUpdateController(
+            client = client,
+            openAiroha = { airoha.openSocket() },
+            reconnect = { null },
+            scope = backgroundScope,
+            clock = { currentTime },
+        )
+
+        val image = FirmwareImage(payload(2 * FlashPlan.PAGE), "2.0.0", "fw.bin", DigestType.NONE, "")
+        val failed = assertIs<FotaPhase.Failed>(controller.run(image, 0x04, client.updateCapability.value))
+
+        assertEquals(FotaFailure.DEVICE_REFUSED, failed.reason)
+        assertTrue(failed.detail.contains("commit status 0x03"))
+        // Commit is retried once, and the written image is never abandoned.
+        assertEquals(2, airoha.commands.count { it == AirohaRace.COMMIT })
+        assertTrue(airoha.cancels.isEmpty())
+        assertEquals(UpdtMessages.DISABLE, mdr.setStatusPayloads.last()[2].toInt() and 0xFF)
         advanceUntilIdle()
     }
 
