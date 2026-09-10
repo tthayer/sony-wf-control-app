@@ -68,7 +68,12 @@ object AirohaRace {
     const val CANCEL_REASON_STAGE_ERROR = 0x01
     const val CANCEL_REASON_RETRY_EXHAUSTED = 0x02
 
-    /** `status & 0x80` on a 0x0402 reply: device busy, retry that page (§6.2). */
+    /**
+     * `status & 0x80` = "device busy" (§6.2). Only ADAPTIVE mode ever strips it;
+     * MT2822/MT2833 never run adaptive, so on this path a status with the high
+     * bit set is simply a non-zero (failure) status. Kept for the diagnostics
+     * decoder and for tests that emulate the byte.
+     */
     const val BUSY_BIT = 0x80
 
     // ---- Timing (§6.3) ----------------------------------------------------
@@ -99,8 +104,13 @@ object AirohaRace {
     /** Retransmit a command whose packet index is this far behind the newest (§6.5). */
     const val RESEND_LAG = 3
 
-    /** `z7/a.java:126-128`: a command that already has 3 retries is fatal. */
-    const val MAX_COMMAND_RETRIES = 3
+    /**
+     * Cap on lag-driven retransmits of ONE page. A lag resend means the ack has
+     * not caught up with the pipeline yet, not that the device is failing, so
+     * the cap is deliberately generous: the real failure detector is the
+     * [TIMEOUT_MS] no-ack stall watchdog.
+     */
+    const val MAX_LAG_RESENDS = 20
 }
 
 /**

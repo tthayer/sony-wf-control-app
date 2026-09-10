@@ -257,6 +257,46 @@ class MtkUpdateControllerTest {
         assertEquals(listOf(AirohaRace.READ_NVKEY), airoha.commands)
         assertTrue(airoha.erases.isEmpty())
         assertTrue(airoha.pageWrites.isEmpty())
+        // Update mode was entered to reach the handshake, so it is left again.
+        assertEquals(
+            listOf(listOf(0x34, 0x04, UpdtMessages.ENABLE), listOf(0x34, 0x04, UpdtMessages.DISABLE)),
+            mdr.setStatusPayloads.map { sent -> sent.map { it.toInt() and 0xFF } },
+        )
+    }
+
+    @Test
+    fun aFailedTransferLeavesUpdateModeAgain() = runTest {
+        val mdr = FakeMdrConnection()
+        val client = SonyProtocolClient(mdr, backgroundScope)
+        client.start()
+        runCurrent()
+
+        // The device refuses 0x1C08, so the transfer fails after update mode is on.
+        val airoha = FakeAirohaFotaDevice(
+            AirohaDeviceConfig(statusOverrides = mapOf(AirohaRace.FOTA_START to 0x05)),
+        )
+        val controller = MtkUpdateController(
+            client = client,
+            openAiroha = { airoha.openSocket() },
+            reconnect = { null },
+            scope = backgroundScope,
+            clock = { currentTime },
+        )
+
+        val terminal = controller.run(
+            FirmwareImage(payload(256), "2.0.0", "fw.bin", DigestType.NONE, ""),
+            0x04,
+            client.updateCapability.value,
+        )
+
+        val failed = assertIs<FotaPhase.Failed>(terminal)
+        assertEquals(FotaFailure.DEVICE_REFUSED, failed.reason)
+        assertTrue(airoha.pageWrites.isEmpty())
+        assertEquals(listOf(AirohaRace.CANCEL_REASON_STAGE_ERROR), airoha.cancels)
+        assertEquals(
+            listOf(listOf(0x34, 0x04, UpdtMessages.ENABLE), listOf(0x34, 0x04, UpdtMessages.DISABLE)),
+            mdr.setStatusPayloads.map { sent -> sent.map { it.toInt() and 0xFF } },
+        )
     }
 
     @Test

@@ -2,6 +2,7 @@ package com.thelightphone.sonywf.update.airoha
 
 import com.thelightphone.sonywf.update.FotaFailure
 import com.thelightphone.sonywf.update.FotaPhase
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.test.currentTime
 import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
@@ -252,6 +253,99 @@ class AirohaFotaSessionTest {
     }
 
     @Test
+    fun anEraseStatusReplyEchoingTheWrongLengthAborts() = runTest {
+        // The bitmap is decoded against the length the device echoes, so a
+        // disagreement must never be papered over.
+        val device = FakeAirohaFotaDevice(AirohaDeviceConfig(eraseStatusLength = 2 * FlashPlan.SECTOR))
+        val race = RaceClient(device.openSocket(), backgroundScope)
+        race.start()
+        runCurrent()
+
+        val terminal = AirohaFotaSession(race) { currentTime }
+            .transfer(payload(FlashPlan.SECTOR), AirohaRace.MODE_BACKGROUND)
+
+        val failed = assertIs<FotaPhase.Failed>(terminal)
+        assertEquals(FotaFailure.OTHER, failed.reason)
+        assertTrue(failed.detail.contains("0x0433 echoed length"))
+        assertTrue(device.erases.isEmpty())
+        assertTrue(device.pageWrites.isEmpty())
+        assertEquals(listOf(AirohaRace.CANCEL_REASON_STAGE_ERROR), device.cancels)
+    }
+
+    @Test
+    fun a0x5BRefusalOfANotifyStageFailsWithoutResending() = runTest {
+        val device = FakeAirohaFotaDevice(
+            AirohaDeviceConfig(rspBeforeNotify = mapOf(AirohaRace.GET_ERASE_STATUS to 0x07)),
+        )
+        val race = RaceClient(device.openSocket(), backgroundScope)
+        race.start()
+        runCurrent()
+
+        val startedAt = currentTime
+        val terminal = AirohaFotaSession(race) { currentTime }
+            .transfer(payload(FlashPlan.PAGE), AirohaRace.MODE_BACKGROUND)
+
+        val failed = assertIs<FotaPhase.Failed>(terminal)
+        assertEquals(FotaFailure.DEVICE_REFUSED, failed.reason)
+        assertTrue(failed.detail.contains("0x0433 status 0x07"))
+        // The refusal ended the stage: no 3 x 9000 ms of resends.
+        assertEquals(1, device.commands.count { it == AirohaRace.GET_ERASE_STATUS })
+        assertTrue(currentTime - startedAt < AirohaRace.TIMEOUT_MS)
+        assertEquals(listOf(AirohaRace.CANCEL_REASON_STAGE_ERROR), device.cancels)
+        assertTrue(device.erases.isEmpty())
+    }
+
+    @Test
+    fun a0x5BAcknowledgementIsIgnoredAndTheNotifyStillCompletesTheStage() = runTest {
+        val image = payload(FlashPlan.PAGE)
+        val device = FakeAirohaFotaDevice(
+            AirohaDeviceConfig(rspBeforeNotify = mapOf(AirohaRace.GET_ERASE_STATUS to 0x00)),
+        )
+        val race = RaceClient(device.openSocket(), backgroundScope)
+        race.start()
+        runCurrent()
+
+        val terminal = AirohaFotaSession(race) { currentTime }.transfer(image, AirohaRace.MODE_BACKGROUND)
+
+        assertEquals(FotaPhase.Transferring(100), terminal)
+        assertEquals(1, device.commands.count { it == AirohaRace.GET_ERASE_STATUS })
+        assertContentEquals(image, device.read(ADDR, image.size))
+        assertTrue(device.cancels.isEmpty())
+    }
+
+    @Test
+    fun aCancelMidTransferKeepsStampingTheSessionFlag() = runTest {
+        var session: AirohaFotaSession? = null
+        // Cancel lands while the flow still has 0x0431 commands to send.
+        val device = FakeAirohaFotaDevice(
+            AirohaDeviceConfig(
+                onCommand = { raceId ->
+                    if (raceId == AirohaRace.GET_ERASE_STATUS) {
+                        backgroundScope.launch { session?.cancel(AirohaRace.CANCEL_REASON_USER) }
+                    }
+                },
+            ),
+        )
+        val race = RaceClient(device.openSocket(), backgroundScope)
+        race.start()
+        runCurrent()
+        val fota = AirohaFotaSession(race) { currentTime }
+        session = fota
+
+        val terminal = fota.transfer(payload(3 * FlashPlan.SECTOR), AirohaRace.MODE_BACKGROUND)
+
+        assertIs<FotaPhase.Failed>(terminal)
+        assertTrue(AirohaRace.CANCEL_REASON_USER in device.cancels)
+        // The cancel frame AND every frame the flow sent after it stay on
+        // byte0 = 0x15: the session ends with the run, not with the cancel.
+        val startedAt = device.writes.indexOfFirst { frameRaceId(it) == AirohaRace.FOTA_START }
+        assertTrue(startedAt > 0)
+        assertTrue(device.writes.drop(startedAt).all { (it[0].toInt() and 0xFF) == 0x15 })
+        assertTrue(device.writes.count { frameRaceId(it) == AirohaRace.CANCEL } >= 1)
+        assertTrue(device.pageWrites.isEmpty())
+    }
+
+    @Test
     fun aFinalStateOtherThan0x0211Fails() = runTest {
         // The device acks every 0x1C06 but never leaves 0x0101.
         val device = FakeAirohaFotaDevice(AirohaDeviceConfig(honourStateWrites = false))
@@ -350,25 +444,66 @@ class AirohaFotaSessionTest {
     }
 
     @Test
-    fun theBusyBitRetriesThePageRatherThanFailing() = runTest {
-        val image = payload(FlashPlan.PAGE)
-        val device = FakeAirohaFotaDevice(AirohaDeviceConfig(busyFirstWrite = true))
+    fun anyNonZeroWriteStatusAbortsBecauseMt28xxNeverRunsAdaptiveMode() = runTest {
+        // 0x80 is the busy bit and 0x81 busy + error; adaptive mode is the only
+        // mode that strips it, and MT2822/MT2833 never run adaptive (§6.2).
+        for (status in listOf(0x80, 0x81)) {
+            val device = FakeAirohaFotaDevice(AirohaDeviceConfig(firstWriteStatus = status))
+            val race = RaceClient(device.openSocket(), backgroundScope)
+            race.start()
+            runCurrent()
+
+            val terminal = AirohaFotaSession(race) { currentTime }
+                .transfer(payload(FlashPlan.PAGE), AirohaRace.MODE_BACKGROUND)
+
+            val failed = assertIs<FotaPhase.Failed>(terminal)
+            assertEquals(FotaFailure.DEVICE_REFUSED, failed.reason)
+            assertTrue(failed.detail.contains("0x0402 status"))
+            assertEquals(listOf(AirohaRace.CANCEL_REASON_STAGE_ERROR), device.cancels)
+            assertTrue(device.pageWrites.isEmpty())
+            // Nothing further was written after the refusal.
+            assertEquals(1, device.commands.count { it == AirohaRace.WRITE_FLASH })
+        }
+    }
+
+    @Test
+    fun lateAcksAreResentWithoutFailingTheTransfer() = runTest {
+        val image = payload(24 * FlashPlan.PAGE)
+        // Acks many pacing intervals late: every page falls past RESEND_LAG
+        // repeatedly, and those resends must not count toward a failure cap.
+        val device = FakeAirohaFotaDevice(AirohaDeviceConfig(ackDelayMs = 4000), backgroundScope)
         val race = RaceClient(device.openSocket(), backgroundScope)
         race.start()
         runCurrent()
 
-        assertEquals(
-            FotaPhase.Transferring(100),
-            AirohaFotaSession(race) { currentTime }.transfer(image, AirohaRace.MODE_BACKGROUND),
-        )
-        // The busy reply was not an ack: the page was written on the retry.
-        assertEquals(1, device.pageWrites.size)
+        val terminal = AirohaFotaSession(race) { currentTime }.transfer(image, AirohaRace.MODE_BACKGROUND)
+
+        assertEquals(FotaPhase.Transferring(100), terminal)
+        assertEquals(24, device.pageWrites.map { it.first }.distinct().size)
+        // The lag path really ran: pages went out more than once.
+        assertTrue(device.pageWrites.size > 24)
+        assertContentEquals(image, device.read(ADDR, image.size))
         assertTrue(device.cancels.isEmpty())
     }
 
     @Test
-    fun neverMoreThanFourCommandsAreOutstanding() = runTest {
+    fun backgroundModeFillsEveryWriteWhileTheWindowHasRoom() = runTest {
         val image = payload(8 * FlashPlan.PAGE)
+        // No acks at all: the window is the only thing limiting the pipeline.
+        val device = FakeAirohaFotaDevice(AirohaDeviceConfig(ackWrites = false))
+        val race = RaceClient(device.openSocket(), backgroundScope)
+        race.start()
+        runCurrent()
+
+        AirohaFotaSession(race) { currentTime }.transfer(image, AirohaRace.MODE_BACKGROUND)
+
+        val writePackets = device.writes.filter { frameRaceId(it) == AirohaRace.WRITE_FLASH }
+        assertEquals(listOf(3 * 269, 3 * 269), writePackets.take(2).map { it.size })
+    }
+
+    @Test
+    fun neverMoreThanFourPacketsAreOutstanding() = runTest {
+        val image = payload(16 * FlashPlan.PAGE)
         val device = FakeAirohaFotaDevice(AirohaDeviceConfig(ackWrites = false))
         val race = RaceClient(device.openSocket(), backgroundScope)
         race.start()
@@ -376,14 +511,14 @@ class AirohaFotaSessionTest {
 
         val terminal = AirohaFotaSession(race) { currentTime }.transfer(image, AirohaRace.MODE_BACKGROUND)
 
+        // Nothing is ever acked, so the no-ack stall watchdog is what ends it.
         val failed = assertIs<FotaPhase.Failed>(terminal)
-        assertEquals(FotaFailure.TRANSFER_FAILED, failed.reason)
-        // The window never opened past 4 distinct pages, and each was retried
-        // at most 3 times before the run was abandoned.
+        assertEquals(FotaFailure.TIMEOUT, failed.reason)
+        // 4 outstanding packets of 3 commands each, and no further page.
         val distinct = device.pageWrites.map { it.first }.distinct()
-        assertEquals(4, distinct.size)
-        assertEquals(listOf(ADDR, ADDR + 256, ADDR + 512, ADDR + 768), distinct)
-        assertTrue(device.pageWrites.count { it.first == ADDR } <= 4)
+        assertEquals(AirohaRace.MAX_OUTSTANDING * AirohaRace.COMMANDS_PER_PACKET, distinct.size)
+        assertEquals(ADDR, distinct.first())
+        assertEquals(ADDR + 11 * FlashPlan.PAGE, distinct.last())
         assertEquals(listOf(AirohaRace.CANCEL_REASON_STAGE_ERROR), device.cancels)
     }
 }

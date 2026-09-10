@@ -1,9 +1,12 @@
 package com.thelightphone.sonywf.update.airoha
 
 import com.thelightphone.sdk.bluetooth.LightSerialConnection
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.receiveAsFlow
+import kotlinx.coroutines.launch
 import java.security.MessageDigest
 
 /** How the emulated MT2822 answers each stage. */
@@ -24,10 +27,18 @@ internal class AirohaDeviceConfig(
     val statusOverrides: Map<Int, Int> = emptyMap(),
     /** Drop the FIRST ack for these page addresses, to force a retransmit. */
     val dropFirstAckFor: Set<Int> = emptySet(),
-    /** Answer the first 0x0402 with the busy bit set. */
-    val busyFirstWrite: Boolean = false,
+    /** Status byte on the FIRST 0x0402 reply; non-zero also means nothing was programmed. */
+    val firstWriteStatus: Int = 0,
     /** Never ack a page write, to exercise the outstanding-window cap. */
     val ackWrites: Boolean = true,
+    /** Delay every 0x0402 ack by this long; needs [FakeAirohaFotaDevice.scope]. */
+    val ackDelayMs: Long = 0,
+    /** Race ids answered with a 0x5B `{status}` BEFORE their normal 0x5D (§6.1). */
+    val rspBeforeNotify: Map<Int, Int> = emptyMap(),
+    /** Length the 0x0433 reply echoes back, when the real region length must not be used. */
+    val eraseStatusLength: Int? = null,
+    /** Fired for every command race id as it arrives, before the reply. */
+    val onCommand: (Int) -> Unit = {},
     /** When false 0x1C06 is acked but the state does not move, so the final 0x1C04 disagrees. */
     val honourStateWrites: Boolean = true,
     /** Commit reboots the device: the socket dies with no reply. */
@@ -43,7 +54,11 @@ internal class AirohaDeviceConfig(
  * tracks erase/write state, computes the real SHA-256 for 0x0431, answers
  * 0x0433 with a bitmap, and enforces the 0x15 session flag after FOTA start.
  */
-internal class FakeAirohaFotaDevice(private val config: AirohaDeviceConfig = AirohaDeviceConfig()) {
+internal class FakeAirohaFotaDevice(
+    private val config: AirohaDeviceConfig = AirohaDeviceConfig(),
+    /** Required only by [AirohaDeviceConfig.ackDelayMs], which replies out of band. */
+    private val scope: CoroutineScope? = null,
+) {
 
     /** Raw writes, so long-packet assembly can be inspected. */
     val writes = mutableListOf<ByteArray>()
@@ -141,7 +156,17 @@ internal class FakeAirohaFotaDevice(private val config: AirohaDeviceConfig = Air
     private fun handle(message: RaceMessage) {
         if (sessionOpen && message.flag != RaceFrame.FLAG_SESSION) flagViolations.add(message.raceId)
         commands.add(message.raceId)
+        config.onCommand(message.raceId)
         val payload = message.payload
+
+        // Some devices acknowledge a 0x5D stage with a bare 0x5B first; a
+        // non-zero status there ends the stage, status 0 does not.
+        val early = config.rspBeforeNotify[message.raceId]
+        if (early != null) {
+            reply(RaceFrame.TYPE_RSP, message.raceId, byteArrayOf(early.toByte()))
+            if (early != 0) return
+        }
+
         when (message.raceId) {
             AirohaRace.READ_NVKEY -> {
                 val name = (config.chipName ?: "").toByteArray(Charsets.ISO_8859_1)
@@ -204,7 +229,7 @@ internal class FakeAirohaFotaDevice(private val config: AirohaDeviceConfig = Air
                     RaceFrame.TYPE_NOTIFY,
                     message.raceId,
                     byteArrayOf(status(message.raceId).toByte(), 0x01, AirohaRace.ROLE_SINGLE.toByte()) +
-                        le32(addr) + le32(length) +
+                        le32(addr) + le32(config.eraseStatusLength ?: length) +
                         byteArrayOf((bitmap.size and 0xFF).toByte(), ((bitmap.size ushr 8) and 0xFF).toByte()) +
                         bitmap,
                 )
@@ -282,7 +307,7 @@ internal class FakeAirohaFotaDevice(private val config: AirohaDeviceConfig = Air
     private fun handleWrite(message: RaceMessage) {
         val payload = message.payload
         val count = payload[1].toInt() and 0xFF
-        val busy = config.busyFirstWrite && writeCommands == 0
+        val st = if (writeCommands == 0) config.firstWriteStatus else 0
         writeCommands++
 
         val acked = ArrayList<Int>(count)
@@ -294,7 +319,7 @@ internal class FakeAirohaFotaDevice(private val config: AirohaDeviceConfig = Air
             if (Crc8.of(data) != crc) badCrcPages.add(addr)
             val sector = addr - (addr - config.partitionAddr) % FlashPlan.SECTOR
             if (sector !in erased) writesToUnerasedSectors.add(addr)
-            if (!busy) {
+            if (st == 0) {
                 pageWrites.add(addr to data)
                 data.forEachIndexed { j, byte -> flash[addr + j] = byte }
             }
@@ -302,15 +327,20 @@ internal class FakeAirohaFotaDevice(private val config: AirohaDeviceConfig = Air
             acked.add(addr)
         }
         if (!config.ackWrites) return
-        if (acked.isEmpty() && !busy) return
+        if (acked.isEmpty() && st == 0) return
 
-        val addresses = if (busy) (0 until count).map { le32At(payload, 2 + it * FlashPlan.RECORD + 1) } else acked
-        var out = byteArrayOf(
-            (if (busy) AirohaRace.BUSY_BIT else 0).toByte(),
-            config.storageType.toByte(),
-            addresses.size.toByte(),
-        )
+        val addresses = if (st != 0) (0 until count).map { le32At(payload, 2 + it * FlashPlan.RECORD + 1) } else acked
+        var out = byteArrayOf(st.toByte(), config.storageType.toByte(), addresses.size.toByte())
         for (addr in addresses) out += le32(addr)
+        if (config.ackDelayMs > 0) {
+            val target = socket
+            val frame = RaceFrame.encode(RaceFrame.FLAG_SESSION, RaceFrame.TYPE_RSP, message.raceId, out)
+            checkNotNull(scope) { "ackDelayMs needs a scope" }.launch {
+                delay(config.ackDelayMs)
+                target?.deliver(frame)
+            }
+            return
+        }
         reply(RaceFrame.TYPE_RSP, message.raceId, out)
     }
 

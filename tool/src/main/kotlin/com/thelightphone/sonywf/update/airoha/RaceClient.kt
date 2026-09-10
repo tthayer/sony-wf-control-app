@@ -89,6 +89,11 @@ class RaceClient(
      * [replyFlagMask] additionally requires those flag bits on the reply: once
      * a FOTA session is open the device sets 0x10 and frames without it are
      * noise (spec-airoha-mt28xx-single §0.1).
+     *
+     * [accept] refines the match inside the SAME subscription: a frame it
+     * rejects is skipped and the wait continues. That is how a stage can ignore
+     * a bare 0x5B acknowledgement and keep waiting for its 0x5D without a gap in
+     * which the 0x5D could be missed.
      */
     suspend fun request(
         raceId: Int,
@@ -98,12 +103,13 @@ class RaceClient(
         retries: Int = DEFAULT_RETRIES,
         acceptTypes: Set<Int> = setOf(RaceFrame.TYPE_RSP, RaceFrame.TYPE_NOTIFY),
         replyFlagMask: Int = 0,
+        accept: (RaceMessage) -> Boolean = { true },
     ): RaceMessage? = sendMutex.withLock {
         // Encode once so every resend is byte-identical.
         val frame = RaceFrame.encode(flag, RaceFrame.TYPE_CMD, raceId, payload)
         var attempt = 0
         while (attempt <= retries) {
-            val reply = attempt(frame, raceId, acceptTypes, timeoutMs, replyFlagMask)
+            val reply = attempt(frame, raceId, acceptTypes, timeoutMs, replyFlagMask, accept)
             if (reply != null) return@withLock reply
             attempt++
         }
@@ -149,6 +155,7 @@ class RaceClient(
         acceptTypes: Set<Int>,
         timeoutMs: Long,
         replyFlagMask: Int,
+        accept: (RaceMessage) -> Boolean,
     ): RaceMessage? = coroutineScope {
         // UNDISPATCHED runs the body until its first real suspension, which is
         // inside SharedFlow.collect AFTER the subscriber slot is registered.
@@ -156,7 +163,8 @@ class RaceClient(
             withTimeoutOrNull(timeoutMs) {
                 messages.first {
                     it.raceId == raceId && it.type in acceptTypes &&
-                        (it.flag and replyFlagMask) == replyFlagMask
+                        (it.flag and replyFlagMask) == replyFlagMask &&
+                        accept(it)
                 }
             }
         }

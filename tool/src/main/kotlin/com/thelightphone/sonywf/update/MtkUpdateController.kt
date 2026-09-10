@@ -9,12 +9,14 @@ import com.thelightphone.sonywf.update.airoha.RaceClient
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 
 /** Airoha chip families, as the substring table in `AirohaFotaAdapterSony.java:217-227` names them. */
@@ -50,6 +52,14 @@ class MtkUpdateController(
     @Volatile
     private var cancelRequested = false
 
+    /** True between UPDT_SET_STATUS ENABLE and the matching DISABLE. */
+    @Volatile
+    private var updateModeOn = false
+
+    /** True once the first flash-writing stage could have run. */
+    @Volatile
+    private var transferBegan = false
+
     private var inquiredType = -1
     private var race: RaceClient? = null
     private var session: AirohaFotaSession? = null
@@ -60,14 +70,34 @@ class MtkUpdateController(
         runStarted = true
         this.inquiredType = inquiredType
 
-        val terminal = try {
-            sequence(image, capability)
+        var terminal: FotaPhase = FotaPhase.Failed(FotaFailure.OTHER, "update did not run")
+        try {
+            terminal = sequence(image, capability)
         } finally {
             mirror?.cancel()
+            // Fail closed: a run that did not complete must not leave the device
+            // in a FOTA session or in MTK update mode. Cleanup is uncancellable
+            // and its results are ignored; the MDR link may already be down.
+            if (terminal is FotaPhase.Failed || terminal is FotaPhase.Cancelled) {
+                withContext(NonCancellable) { teardown() }
+            }
             race?.stop()
         }
         _phase.value = terminal
         return terminal
+    }
+
+    /** Best-effort return to a known state. Safe to call twice. */
+    private suspend fun teardown() {
+        // Only a transfer that started can have left FOTA state to abandon; the
+        // session itself stays silent when it never opened one.
+        if (transferBegan && race?.connected?.value == true) {
+            session?.cancel(AirohaRace.CANCEL_REASON_STAGE_ERROR)
+        }
+        if (updateModeOn) {
+            updateModeOn = false
+            setUpdateStatus(false)
+        }
     }
 
     /**
@@ -84,7 +114,10 @@ class MtkUpdateController(
             else -> Unit
         }
         session?.cancel(AirohaRace.CANCEL_REASON_STAGE_ERROR)
-        setUpdateStatus(false)
+        if (updateModeOn) {
+            updateModeOn = false
+            setUpdateStatus(false)
+        }
         _phase.value = FotaPhase.Cancelled
     }
 
@@ -106,6 +139,7 @@ class MtkUpdateController(
         if (!setUpdateStatus(true)) {
             return FotaPhase.Failed(FotaFailure.DEVICE_REFUSED, "UPDT_SET_STATUS enable not acked")
         }
+        updateModeOn = true
         if (cancelRequested) return FotaPhase.Cancelled
 
         // Chip handshake on its own socket, exactly as the Sony app does: read
@@ -130,6 +164,7 @@ class MtkUpdateController(
         // Background transfer is a device-reported capability; Active otherwise.
         // MT2822/MT2833 never use Adaptive (spec §3.2).
         val mode = if (capability.backgroundTransfer) AirohaRace.MODE_BACKGROUND else AirohaRace.MODE_ACTIVE
+        transferBegan = true
         val transferred = fota.transfer(image.bytes, mode)
         mirror?.cancel()
         if (transferred !is FotaPhase.Transferring) return transferred

@@ -22,8 +22,8 @@ import kotlinx.coroutines.yield
  * This class WRITES FLASH. It is deliberately fail-closed:
  *  - nothing is sent after 0x1C08 unless the size guard and the 0x1C04 state
  *    guard both passed (the caller separately gates on chip family and TWS),
- *  - any non-zero status on a stage reply (other than the 0x0402 busy bit)
- *    aborts the run and sends cancel 0x1C03 reason 1,
+ *  - any non-zero status on a stage reply aborts the run and sends cancel
+ *    0x1C03 reason 1,
  *  - a sector is programmed only when it is known-erased or its device-side
  *    SHA-256 already matched, never otherwise.
  *
@@ -128,6 +128,14 @@ class AirohaFotaSession(
             runTransfer(image, mode)
         } finally {
             flowActive = false
+        }
+        // Terminal path owns the session flag: [cancel] must not clear it while
+        // the flow is still sending, or the frames after it would drop to 0x05.
+        // A completed transfer keeps it, because the commit that follows rides
+        // the same session (§0.1).
+        if (terminal !is FotaPhase.Transferring) {
+            sessionOpen = false
+            rxFilterOn = false
         }
         _phase.value = terminal
         return terminal
@@ -288,9 +296,12 @@ class AirohaFotaSession(
             // Teardown: take the reply whatever byte0 it carries.
             replyFlagMask = 0,
         )
-        // The device is out of the session either way; stop stamping 0x15.
-        sessionOpen = false
-        rxFilterOn = false
+        // Only a cancel from outside a run ends the session here; a running
+        // [transfer] still has frames to send and clears the flag itself.
+        if (!flowActive) {
+            sessionOpen = false
+            rxFilterOn = false
+        }
     }
 
     // ---- Stages ------------------------------------------------------------
@@ -313,6 +324,12 @@ class AirohaFotaSession(
             }
             if (le32(rx, 9) != addr) {
                 return abort(FotaFailure.OTHER, "0x0433 echoed 0x${hex8(le32(rx, 9))}, expected 0x${hex8(addr)}")
+            }
+            // The bitmap is indexed off the region length the DEVICE echoes
+            // (`g8/h.java:145`); decoding it against a different length would
+            // mark the wrong sectors erased.
+            if (le32(rx, 13) != length) {
+                return abort(FotaFailure.OTHER, "0x0433 echoed length ${le32(rx, 13)}, expected $length")
             }
             val count = length / FlashPlan.SECTOR
             val bitmapBytes = le16(rx, 17)
@@ -431,14 +448,13 @@ class AirohaFotaSession(
 
     private class WriteCommand(val addr: Int, val frame: ByteArray) {
         var packetIndex = 0
-        var retries = 0
-        var resendNow = false
+        var lagResends = 0
     }
 
     /**
      * 0x0402 for every page of every sector still needing programming (§3.9,
      * §6.5). Background mode concatenates up to 3 complete frames into one
-     * write, keeps at most 4 commands outstanding, paces writes, and resends a
+     * write, keeps at most 4 packets outstanding, paces writes, and resends a
      * command whose packet index has fallen [AirohaRace.RESEND_LAG] behind the
      * newest. Active mode is the same code with one command per write and no
      * pacing.
@@ -494,20 +510,24 @@ class AirohaFotaSession(
                 val batch = ArrayList<WriteCommand>(commandsPerPacket)
                 for (command in pending.values.toList()) {
                     if (batch.size >= commandsPerPacket) break
-                    if (!command.resendNow && command.packetIndex + AirohaRace.RESEND_LAG >= packetIndex) continue
-                    if (command.retries >= AirohaRace.MAX_COMMAND_RETRIES) {
+                    if (command.packetIndex + AirohaRace.RESEND_LAG >= packetIndex) continue
+                    // A lag resend is pipeline slack, not a device failure, so
+                    // it gets its own generous cap; the stall watchdog below is
+                    // what actually ends a dead transfer.
+                    if (command.lagResends >= AirohaRace.MAX_LAG_RESENDS) {
                         return@coroutineScope abort(
                             FotaFailure.TRANSFER_FAILED,
-                            "page 0x${hex8(command.addr)} not acked after ${command.retries} retries",
+                            "page 0x${hex8(command.addr)} not acked after ${command.lagResends} resends",
                         )
                     }
-                    command.retries++
-                    command.resendNow = false
+                    command.lagResends++
                     command.packetIndex = packetIndex
                     batch.add(command)
                 }
+                // The window caps outstanding PACKETS (§6.4), and one packet
+                // carries [commandsPerPacket] commands.
                 while (batch.size < commandsPerPacket &&
-                    pending.size < AirohaRace.MAX_OUTSTANDING &&
+                    pending.size < AirohaRace.MAX_OUTSTANDING * commandsPerPacket &&
                     queue.isNotEmpty()
                 ) {
                     val command = queue.removeFirst()
@@ -566,26 +586,19 @@ class AirohaFotaSession(
 
     /**
      * One 0x0402 reply: `rx[8]` acked-page count, addresses from `rx[9]` LE32.
-     * `status & 0x80` is the busy bit and means "retry that page"; any other
-     * non-zero status aborts.
+     * ANY non-zero status is a device error here: the 0x80 busy bit is stripped
+     * only in adaptive mode, which MT2822/MT2833 never run (§6.2).
      */
     private suspend fun handleWriteAck(rx: RaceMessage, pending: MutableMap<Int, WriteCommand>): FotaPhase? {
         val status = rx.rx(6)
-        val busy = (status and AirohaRace.BUSY_BIT) != 0
-        if (status != 0 && !busy) {
+        if (status != 0) {
             return abort(FotaFailure.DEVICE_REFUSED, "0x0402 status 0x${hex2(status)}")
         }
         val count = rx.rx(8)
         if (count <= 0) return null
         for (i in 0 until count) {
             if (rx.rx(9 + i * 4 + 3) < 0) break
-            val addr = le32(rx, 9 + i * 4)
-            val command = pending[addr] ?: continue
-            if (busy) {
-                command.resendNow = true
-            } else {
-                pending.remove(addr)
-            }
+            pending.remove(le32(rx, 9 + i * 4))
         }
         return null
     }
@@ -596,17 +609,28 @@ class AirohaFotaSession(
 
     private fun rxMask(): Int = if (rxFilterOn) RaceFrame.FLAG_SESSION else 0
 
-    /** One stage command: 9000 ms, 3 sends, exactly the response type the spec lists. */
-    private suspend fun command(raceId: Int, payload: ByteArray, acceptType: Int): RaceMessage? =
-        race.request(
+    /**
+     * One stage command: 9000 ms, 3 sends, the response type the spec lists.
+     *
+     * A stage whose result is a 0x5D may still be REFUSED by a 0x5B carrying a
+     * non-zero status (§6.1: `handleResp` matches on the race id alone). Take
+     * that refusal immediately instead of resending for the whole 27 s budget.
+     * A 0x5B with status 0 is only an acknowledgement, so it is skipped and the
+     * wait for the 0x5D continues inside the same subscription.
+     */
+    private suspend fun command(raceId: Int, payload: ByteArray, acceptType: Int): RaceMessage? {
+        val notifyStage = acceptType == RaceFrame.TYPE_NOTIFY
+        return race.request(
             raceId = raceId,
             payload = payload,
             flag = txFlag(),
             timeoutMs = AirohaRace.TIMEOUT_MS,
             retries = AirohaRace.ATTEMPTS - 1,
-            acceptTypes = setOf(acceptType),
+            acceptTypes = if (notifyStage) NOTIFY_OR_RSP else setOf(acceptType),
             replyFlagMask = rxMask(),
+            accept = { if (notifyStage) it.type == RaceFrame.TYPE_NOTIFY || it.rx(6) != 0 else true },
         )
+    }
 
     /** [command] plus the "status must be 0" rule; returns a terminal phase or null. */
     private suspend fun commandOk(raceId: Int, payload: ByteArray, acceptType: Int): FotaPhase? {
@@ -644,5 +668,8 @@ class AirohaFotaSession(
     private companion object {
         /** Active mode has no pacing, so idle polls need their own short wait. */
         const val IDLE_WAIT_MS = 20L
+
+        /** A 0x5D stage also has to hear a 0x5B refusal for the same race id. */
+        val NOTIFY_OR_RSP = setOf(RaceFrame.TYPE_NOTIFY, RaceFrame.TYPE_RSP)
     }
 }
