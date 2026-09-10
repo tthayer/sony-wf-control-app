@@ -35,6 +35,8 @@ sealed interface SonyEvent {
     data class Anc(val status: AncStatus) : SonyEvent
     data class Battery(val battery: SonyBattery) : SonyEvent
     data class Firmware(val version: String) : SonyEvent
+    data class ModelName(val name: String) : SonyEvent
+    data class SupportFunctions(val functions: Set<Int>) : SonyEvent
 }
 
 /**
@@ -59,8 +61,12 @@ object SonyResponses {
     const val V2_BATTERY_RET = 0x23
     const val V2_BATTERY_NOTIFY = 0x25
 
-    // Firmware reply (0x05); paired with sub 0x02.
+    // Firmware reply (0x05); paired with sub 0x02. The same opcode with sub 0x01
+    // is the model-name reply, hence the sub-byte check in both parsers.
     const val FIRMWARE_RET = 0x05
+
+    /** CONNECT_RET_SUPPORT_FUNCTION opcode (V2 only). */
+    const val SUPPORT_FUNCTION_RET = 0x07
 
     /** The Init reply is a Command1 whose payload[0] is this marker. */
     const val INIT_REPLY_MARKER = 0x01
@@ -75,6 +81,8 @@ object SonyResponses {
     fun isAncReply(opcode: Int): Boolean = opcode == ANC_RET || opcode == ANC_NOTIFY
 
     fun isFirmwareReply(opcode: Int): Boolean = opcode == FIRMWARE_RET
+
+    fun isSupportFunctionReply(opcode: Int): Boolean = opcode == SUPPORT_FUNCTION_RET
 
     // ---- Init / dialect detection ------------------------------------------
 
@@ -226,17 +234,51 @@ object SonyResponses {
 
     /**
      * Parse a firmware reply `{0x05, 0x02, len, ASCII...}` into the version
-     * string, or null if the payload is malformed.
+     * string, or null if the payload is malformed. Deliberately rejects the
+     * model-name reply `{0x05, 0x01, ...}`, which shares the opcode.
      */
-    fun parseFirmware(payload: ByteArray): String? {
+    fun parseFirmware(payload: ByteArray): String? =
+        parseDeviceInfoString(payload, SonyCommands.FIRMWARE_SUB)
+
+    /**
+     * Parse a model-name reply `{0x05, 0x01, len, ASCII...}`, or null if the
+     * payload is malformed (or is the firmware reply `05 02 ...`).
+     */
+    fun parseModelName(payload: ByteArray): String? =
+        parseDeviceInfoString(payload, SonyCommands.DEVICE_INFO_MODEL_SUB)
+
+    /** `{0x05, sub, len, ASCII...}` — the shared CONNECT_RET_DEVICE_INFO shape. */
+    private fun parseDeviceInfoString(payload: ByteArray, sub: Int): String? {
         if (payload.size < 3) return null
         if ((payload[0].toInt() and 0xFF) != FIRMWARE_RET) return null
-        if ((payload[1].toInt() and 0xFF) != SonyCommands.FIRMWARE_SUB) return null
+        if ((payload[1].toInt() and 0xFF) != sub) return null
         val len = payload[2].toInt() and 0xFF
         val end = minOf(3 + len, payload.size)
         if (end <= 3) return null
         val bytes = payload.copyOfRange(3, end)
         return String(bytes, Charsets.US_ASCII)
+    }
+
+    // ---- Support functions -------------------------------------------------
+
+    /**
+     * Parse `{0x07, table, count, {functionType, capabilityCounter} * count}`
+     * into the set of advertised table-1 function bytes. `0x00` (NO_USE) is
+     * dropped. Returns null unless the declared count exactly accounts for the
+     * payload. The table byte is not checked: it echoes the request and no
+     * other table is ever queried here.
+     */
+    fun parseSupportFunctions(payload: ByteArray): Set<Int>? {
+        if (payload.size < 3) return null
+        if ((payload[0].toInt() and 0xFF) != SUPPORT_FUNCTION_RET) return null
+        val count = payload[2].toInt() and 0xFF
+        if (payload.size != 3 + 2 * count) return null
+        val out = LinkedHashSet<Int>(count)
+        for (i in 0 until count) {
+            val fn = payload[3 + 2 * i].toInt() and 0xFF
+            if (fn != 0x00) out.add(fn)
+        }
+        return out
     }
 
     // ---- Dispatcher --------------------------------------------------------
@@ -253,7 +295,11 @@ object SonyResponses {
         return when {
             isAncReply(opcode) -> parseAnc(dialect, payload)?.let { SonyEvent.Anc(it) }
             isBatteryReply(dialect, opcode) -> parseBattery(dialect, payload)?.let { SonyEvent.Battery(it) }
-            isFirmwareReply(opcode) -> parseFirmware(payload)?.let { SonyEvent.Firmware(it) }
+            // 0x05 carries both the version (sub 0x02) and the model name (sub 0x01).
+            isFirmwareReply(opcode) ->
+                parseFirmware(payload)?.let { SonyEvent.Firmware(it) }
+                    ?: parseModelName(payload)?.let { SonyEvent.ModelName(it) }
+            isSupportFunctionReply(opcode) -> parseSupportFunctions(payload)?.let { SonyEvent.SupportFunctions(it) }
             else -> null
         }
     }
