@@ -229,6 +229,29 @@ class UpdtMessagesTest {
         assertNull(UpdtMessages.parseParam(bytes(0x37, 0x10, 200) + ByteArray(200)))
     }
 
+    @Test
+    fun parseParamAcceptsTheAutoUpdateFlagOnlyForInq04() {
+        // Live WF-1000XM6 reply (inq 0x04), trailing 0x00 = auto-update ON.
+        val xm6 = bytes(
+            0x37, 0x04, 0x05, 0x48, 0x50, 0x30, 0x30, 0x32, 0x0b, 0x4d, 0x44, 0x52, 0x49, 0x44,
+            0x32, 0x39, 0x38, 0x35, 0x30, 0x30, 0x02, 0x55, 0x43, 0x00, 0x0e, 0x32, 0x30, 0x37,
+            0x38, 0x34, 0x32, 0x39, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x14, 0x14, 0x10,
+            0x33, 0x38, 0x45, 0x36, 0x46, 0x46, 0x41, 0x45, 0x41, 0x41, 0x30, 0x32, 0x37, 0x31,
+            0x35, 0x31, 0x00,
+        )
+        val params = UpdtMessages.parseParam(xm6)
+        assertEquals("HP002", params?.categoryId)
+        assertEquals("MDRID298500", params?.serviceId)
+        assertEquals("UC", params?.nationCode)
+        assertEquals(20, params?.batteryThreshold)
+        assertEquals("38E6FFAEAA027151", params?.uniqueId)
+
+        // The flag is required for inq 0x04, must be a valid OnOff, and only once.
+        assertNull(UpdtMessages.parseParam(xm6.copyOf(xm6.size - 1)))
+        assertNull(UpdtMessages.parseParam(xm6.copyOf(xm6.size - 1) + bytes(0x02)))
+        assertNull(UpdtMessages.parseParam(xm6 + bytes(0x00)))
+    }
+
     // ---- Notifications -----------------------------------------------------
 
     @Test
