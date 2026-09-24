@@ -77,6 +77,7 @@ object SonyCommands {
      * NoiseAdaptiveMode enum (ON 0x00) used by Adaptive Sound Control.
      */
     const val NOISE_ADAPTIVE_OFF = 0x00
+    const val NOISE_ADAPTIVE_ON = 0x01
 
     // ---- Firmware ----------------------------------------------------------
 

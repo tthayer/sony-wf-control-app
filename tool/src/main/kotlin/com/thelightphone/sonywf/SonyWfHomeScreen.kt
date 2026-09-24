@@ -18,6 +18,7 @@ import com.thelightphone.sdk.LightScreen
 import com.thelightphone.sdk.SealedLightActivity
 import com.thelightphone.sdk.ui.LightBarButton
 import com.thelightphone.sdk.ui.LightBottomBar
+import com.thelightphone.sdk.ui.LightIcons
 import com.thelightphone.sdk.ui.LightScrollView
 import com.thelightphone.sdk.ui.LightText
 import com.thelightphone.sdk.ui.LightTextVariant
@@ -27,7 +28,9 @@ import com.thelightphone.sdk.ui.LightThemeTokens
 import com.thelightphone.sdk.ui.LightTopBar
 import com.thelightphone.sdk.ui.LightTopBarCenter
 import com.thelightphone.sdk.ui.gridUnitsAsDp
+import com.thelightphone.sdk.ui.lightClickable
 import com.thelightphone.sonywf.protocol.AncMode
+import com.thelightphone.sonywf.protocol.PlaybackState
 import com.thelightphone.sonywf.protocol.SonyBattery
 import com.thelightphone.sonywf.update.FirmwareUpdateMethod
 
@@ -51,8 +54,21 @@ class SonyWfHomeScreen(sealedActivity: SealedLightActivity) :
                     .fillMaxSize()
                     .background(LightThemeTokens.colors.background),
             ) {
+                val connected = state as? SonyUiState.Connected
+                val onSettings = connected?.extras?.showingSettings == true
                 LightTopBar(
-                    center = LightTopBarCenter.Text(title(state)),
+                    leftButton = if (onSettings) {
+                        LightBarButton.LightIcon(icon = LightIcons.BACK, onClick = viewModel::closeSettings)
+                    } else {
+                        null
+                    },
+                    center = LightTopBarCenter.Text(if (onSettings) "Settings" else title(state)),
+                    // The settings page is for live devices only, and never mid-update.
+                    rightButton = if (connected != null && !onSettings && !updateOwnsBar(connected.update)) {
+                        LightBarButton.LightIcon(icon = LightIcons.SETTINGS, onClick = viewModel::openSettings)
+                    } else {
+                        null
+                    },
                     modifier = Modifier.padding(bottom = 1f.gridUnitsAsDp()),
                 )
 
@@ -71,7 +87,8 @@ class SonyWfHomeScreen(sealedActivity: SealedLightActivity) :
                             "Bluetooth isn't available on this device."
                         )
                         is SonyUiState.Failed -> CenteredMessage(s.message)
-                        is SonyUiState.Connected -> ConnectedBody(s)
+                        is SonyUiState.Connected ->
+                            if (s.extras.showingSettings) SettingsBody(s.extras) else ConnectedBody(s)
                     }
                 }
 
@@ -85,7 +102,9 @@ class SonyWfHomeScreen(sealedActivity: SealedLightActivity) :
 
     private fun bottomBarButtons(state: SonyUiState): List<LightBarButton> =
         when (state) {
-            is SonyUiState.Connected -> {
+            is SonyUiState.Connected -> if (state.extras.showingSettings) {
+                playbackButtons(state.extras.playback)
+            } else {
                 val update = updateButtons(state.update, state.updateMethod)
                 if (updateOwnsBar(state.update)) {
                     update
@@ -243,6 +262,68 @@ class SonyWfHomeScreen(sealedActivity: SealedLightActivity) :
                 )
             }
         }
+    }
+
+    /** Volume down, previous, play/pause, next, volume up: icons, so all five fit. */
+    private fun playbackButtons(p: PlaybackState?): List<LightBarButton> {
+        if (p == null) return emptyList()
+        return listOf(
+            LightBarButton.LightIcon(icon = LightIcons.DOWN, onClick = viewModel::volumeDown, contentDescription = "Volume down"),
+            LightBarButton.LightIcon(icon = LightIcons.REWIND, onClick = viewModel::previousTrack, contentDescription = "Previous"),
+            LightBarButton.LightIcon(
+                icon = if (p.playing == true) LightIcons.PAUSE else LightIcons.PLAY,
+                onClick = viewModel::playPause,
+                contentDescription = if (p.playing == true) "Pause" else "Play",
+            ),
+            LightBarButton.LightIcon(icon = LightIcons.FAST_FORWARD, onClick = viewModel::nextTrack, contentDescription = "Next"),
+            LightBarButton.LightIcon(icon = LightIcons.UP, onClick = viewModel::volumeUp, contentDescription = "Volume up"),
+        )
+    }
+
+    /** One tappable "Title: value" row per setting; tapping steps to the next option. */
+    @Composable
+    private fun SettingsBody(e: DeviceExtras) {
+        LightScrollView(
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(horizontal = 1.5f.gridUnitsAsDp()),
+        ) {
+            e.playback?.let { p ->
+                val track = p.track?.takeIf { it.isNotEmpty() } ?: "Nothing playing"
+                LightText(text = track, variant = LightTextVariant.Copy)
+                p.volume?.let {
+                    LightText(text = "Volume $it / ${p.volumeMax}", variant = LightTextVariant.Fine, lighten = true)
+                }
+            }
+            e.autoAmbient?.let { on ->
+                SettingRow("Auto ambient sound", if (on) "On" else "Off", viewModel::toggleAutoAmbient)
+            }
+            if (e.settings.isEmpty()) {
+                LightText(text = "Reading settings…", variant = LightTextVariant.Fine, lighten = true)
+            }
+            for (setting in e.settings) {
+                SettingRow(setting.setting.title, setting.valueLabel) { viewModel.cycleSetting(setting.setting.key) }
+            }
+            if (e.canPowerOff) {
+                SettingRow(
+                    if (e.powerOffArmed) "Tap again to power off" else "Power off",
+                    null,
+                    viewModel::powerOff,
+                )
+            }
+        }
+    }
+
+    @Composable
+    private fun SettingRow(title: String, value: String?, onClick: () -> Unit) {
+        LightText(
+            text = if (value == null) title else "$title: $value",
+            variant = LightTextVariant.Copy,
+            modifier = Modifier
+                .fillMaxWidth()
+                .lightClickable(onClick = onClick)
+                .padding(vertical = 0.75f.gridUnitsAsDp()),
+        )
     }
 
     /** Raw DIAG report: smallest style, monospaced, scrollable, never truncated. */
