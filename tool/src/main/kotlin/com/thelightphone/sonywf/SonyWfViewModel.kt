@@ -149,8 +149,10 @@ class SonyWfViewModel(
             try {
                 val paired = bluetooth.pairedDevices()
                 // Sony-named devices first; only fall back to probing others if none match.
+                // Within that, devices with a live audio link go first: each absent
+                // device costs a ~5 s page timeout per service UUID.
                 val sony = paired.filter { isLikelySony(it.name) }
-                val candidates = if (sony.isNotEmpty()) sony else paired
+                val candidates = (if (sony.isNotEmpty()) sony else paired).sortedByDescending { it.connected }
                 for (device in candidates) {
                     for (uuid in listOf(SONY_SERVICE_UUID_V2, SONY_SERVICE_UUID_V1)) {
                         val conn = try {
@@ -264,7 +266,8 @@ class SonyWfViewModel(
             }
             _update.value = when (result) {
                 is UpdateCheck.UpToDate -> FirmwareUpdateUi.UpToDate
-                is UpdateCheck.Error -> FirmwareUpdateUi.Failed(result.message)
+                // A failed check must not block the controls; it re-runs on the next connect.
+                is UpdateCheck.Error -> FirmwareUpdateUi.CheckFailed(result.message)
                 is UpdateCheck.Available -> {
                     // Tandem over MDR and MTK over Airoha RACE can both be driven
                     // from here; MC_APP has no transport of ours, so it stays check-only.
