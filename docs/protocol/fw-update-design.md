@@ -138,7 +138,7 @@ object UpdtMessages {
 
     // parsers (return null when the payload is not that message / malformed)
     fun parseCapability(payload: ByteArray): UpdateCapability?     // 0x31, len 7, payload[2]==4
-    fun parseParam(payload: ByteArray): UpdateParams?              // 0x37, chained str{128} x5, u8, u8, str{128}
+    fun parseParam(payload: ByteArray): UpdateParams?              // 0x37, chained str{128} x5, u8, u8, str{128}; inq 0x04 adds a trailing u8 auto-update OnOff (required, not surfaced)
     fun parseNotify(payload: ByteArray): UpdtNotify?               // 0x33/0x35/0x39/0x3F as above
 }
 ```
@@ -332,6 +332,14 @@ Wire source of truth: `spec-airoha-mt28xx-single.md` (byte-exact, MT2822/MT2833/
 overview in `spec-airoha-fota.md`. On-device facts (WH-1000XM5, 2026-09-09): chip name `MT2822S`,
 partition addr `0x00BDA000` len `0x00962000` storageType 0, state `0x0101`; GetVersion/GetBattery
 answer 0x5B with an empty payload, so nothing may depend on them. Framing confirmed.
+
+On-device facts (WF-1000XM6, fw 1.6.0, 2026-09-24, read-only probe): support function 0x34 only (no
+0x30) → MTK, inquired type 0x04; `UPDT_RET_CAPABILITY` `31 04 03 00 00 00` (resumable, **tws**,
+background); `UPDT_RET_PARAM` carries the inq-0x04 trailing auto-update byte (`spec-tandem-fota.md`
+§3.6). RACE on its own RFCOMM channel: chip name `MT2833_Earbuds`; 0x0CC4 role `0x40` (agent);
+0x0D00 GetAvailableDst `05 06`; 0x1C04 state `0xFFFF`; 0x1C00 partition 0 storage 0 addr
+`0x00928000` len `0x005B7000`; 0x1C07/0x0CD6 answer 0x5B status 0 then a 0x5D with the data
+(`v1.0.0`, 99%). TWS, so v1 refuses it (below).
 
 Scope v1: single device only (capability `tws == false`), chips MT2822 and MT2833 (mode byte
 Background `0x00` when `UpdateCapability.backgroundTransfer` else Active `0x01`). MT2855 and TWS
