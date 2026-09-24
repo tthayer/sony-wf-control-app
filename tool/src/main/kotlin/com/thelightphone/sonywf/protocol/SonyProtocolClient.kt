@@ -151,6 +151,13 @@ class SonyProtocolClient(
     @Volatile
     private var ancWind: Boolean = false
 
+    /** Last reported 0x19-layout noise-adaptive bytes, echoed by [setAnc]. */
+    @Volatile
+    private var ancNoiseAdaptive: Int = SonyCommands.NOISE_ADAPTIVE_OFF
+
+    @Volatile
+    private var ancAdaptiveSensitivity: Int = 0
+
     // ---- Battery accumulation ----------------------------------------------
     //
     // Battery replies arrive as separate SINGLE / DUAL / CASE messages that we
@@ -248,14 +255,26 @@ class SonyProtocolClient(
     }
 
     /**
-     * Probe the ANC variant. For V2, try the wind sub-byte (0x17) first and fall
-     * back to the standard sub-byte (0x15); for V1, use sub 0x02. The discovered
+     * Probe the ANC variant. For V2, try the noise-adaptive sub-byte (0x19,
+     * WF-1000XM6), then the wind sub-byte (0x17), then the standard sub-byte
+     * (0x15); for V1, use sub 0x02. The discovered
      * sub-byte + wind flag drive [setAnc]. [ancSupported] flips true whenever a
      * valid ANC reply is observed (handled in the inbound loop).
      */
     private suspend fun discoverAnc(dialect: SonyDialect) {
         when (dialect) {
             SonyDialect.V2 -> {
+                // Only a well-formed 9-byte reply counts: other devices ignore 0x19.
+                val adaptive = query(
+                    SonyCommands.ancGet(dialect, SonyCommands.V2_ANC_SUB_ADAPTIVE),
+                    SonyResponses.ANC_RET,
+                    replySub = SonyCommands.V2_ANC_SUB_ADAPTIVE,
+                )
+                if (adaptive != null && SonyResponses.parseAnc(dialect, adaptive.payload) != null) {
+                    ancSubByte = SonyCommands.V2_ANC_SUB_ADAPTIVE
+                    ancWind = false
+                    return
+                }
                 var reply = query(SonyCommands.ancGet(dialect, SonyCommands.V2_ANC_SUB_WIND), SonyResponses.ANC_RET)
                 if (reply != null) {
                     ancSubByte = SonyCommands.V2_ANC_SUB_WIND
@@ -335,7 +354,11 @@ class SonyProtocolClient(
     suspend fun setAnc(mode: AncMode, level: Int, voicePassthrough: Boolean) {
         if (!_ancSupported.value) return
         val dialect = _dialect.value ?: return
-        val payload = SonyCommands.ancSet(dialect, ancSubByte, ancWind, mode, level, voicePassthrough)
+        val payload = SonyCommands.ancSet(
+            dialect, ancSubByte, ancWind, mode, level, voicePassthrough,
+            noiseAdaptive = ancNoiseAdaptive,
+            adaptiveSensitivity = ancAdaptiveSensitivity,
+        )
         sendCommand(SonyFrame.TYPE_COMMAND1, payload)
         _ancMode.value = mode
         _ambientLevel.value = level.coerceIn(0, 20)
@@ -486,6 +509,8 @@ class SonyProtocolClient(
                 _ancMode.value = event.status.mode
                 _ambientLevel.value = event.status.ambientLevel
                 _voicePassthrough.value = event.status.voicePassthrough
+                event.status.noiseAdaptive?.let { ancNoiseAdaptive = it }
+                event.status.adaptiveSensitivity?.let { ancAdaptiveSensitivity = it }
             }
             is SonyEvent.Battery -> {
                 val kind = SonyResponses.batteryReplyKind(dialect, message.payload)

@@ -63,6 +63,17 @@ object SonyCommands {
     /** V2 ANC sub-byte for wind-capable / ASC2 models, 8-byte set buffer. */
     const val V2_ANC_SUB_WIND = 0x17
 
+    /**
+     * V2 ANC sub-byte `MODE_NC_ASM_DUAL_NC_MODE_SWITCH_AND_ASM_SEAMLESS_NA`
+     * (WF-1000XM6), 9-byte buffer with noise-adaptive fields (`rf0/g.java`).
+     * The XM6 answers a 0x17 GET with an all-zero payload, so this must be
+     * probed first.
+     */
+    const val V2_ANC_SUB_ADAPTIVE = 0x19
+
+    /** NoiseAdaptiveOnOffValue OFF for the 0x19 layout (ON is 0x00). */
+    const val NOISE_ADAPTIVE_OFF = 0x01
+
     // ---- Firmware ----------------------------------------------------------
 
     const val FIRMWARE_GET = 0x04
@@ -128,6 +139,14 @@ object SonyCommands {
      * Note byte-4 is INVERTED between the dialects: on V2 `0=NoiseCancel/1=Ambient`
      * is folded into `[3]/[4]`, whereas V1 encodes the mode directly in `[4]`.
      *
+     * V2 sub `0x19` (9 bytes, `pf0/d1.java`, `rf0/g.java`):
+     * ```
+     * [0]=0x68 [1]=0x19 [2]=0x01(changed) [3]=(mode!=OFF?1:0) [4]=(mode==AMBIENT?1:0)
+     * [5]=voice?1:0 [6]=level [7]=noiseAdaptive [8]=adaptiveSensitivity
+     * ```
+     * [noiseAdaptive] and [adaptiveSensitivity] are echoed from the last status
+     * so a mode change does not reset the device's noise-adaptive setting.
+     *
      * @param level ambient level; coerced into `0..20`.
      */
     fun ancSet(
@@ -137,6 +156,8 @@ object SonyCommands {
         mode: AncMode,
         level: Int,
         voice: Boolean,
+        noiseAdaptive: Int = NOISE_ADAPTIVE_OFF,
+        adaptiveSensitivity: Int = 0,
     ): ByteArray {
         val voiceByte = if (voice) 1 else 0
         val levelByte = level.coerceIn(0, 20)
@@ -144,7 +165,19 @@ object SonyCommands {
             SonyDialect.V2 -> {
                 val ncByte = if (mode == AncMode.OFF) 0 else 1
                 val ambientByte = if (mode == AncMode.AMBIENT) 1 else 0
-                if (wind) {
+                if (subByte == V2_ANC_SUB_ADAPTIVE) {
+                    byteArrayOf(
+                        ANC_SET.toByte(),
+                        subByte.toByte(),
+                        0x01,
+                        ncByte.toByte(),
+                        ambientByte.toByte(),
+                        voiceByte.toByte(),
+                        levelByte.toByte(),
+                        noiseAdaptive.toByte(),
+                        adaptiveSensitivity.toByte(),
+                    )
+                } else if (wind) {
                     byteArrayOf(
                         ANC_SET.toByte(),
                         subByte.toByte(),

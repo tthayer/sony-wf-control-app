@@ -213,6 +213,34 @@ class SonyCommandsAndResponsesTest {
     }
 
     @Test
+    fun ancSetV2AdaptiveSub19Is9BytesAndEchoesAdaptiveFields() {
+        val amb = SonyCommands.ancSet(
+            SonyDialect.V2, SonyCommands.V2_ANC_SUB_ADAPTIVE, wind = false, AncMode.AMBIENT, level = 12, voice = true,
+            noiseAdaptive = 0x00, adaptiveSensitivity = 0x02,
+        )
+        assertContentEquals(bytes(0x68, 0x19, 0x01, 0x01, 0x01, 0x01, 0x0c, 0x00, 0x02), amb)
+        val off = SonyCommands.ancSet(SonyDialect.V2, 0x19, wind = false, AncMode.OFF, level = 20, voice = false)
+        assertContentEquals(bytes(0x68, 0x19, 0x01, 0x00, 0x00, 0x00, 0x14, 0x01, 0x00), off)
+    }
+
+    @Test
+    fun parseAncV2AdaptiveSub19LiveXm6Reply() {
+        // Live WF-1000XM6 GET 66 19 reply: NC on, noise cancelling, level 20, adaptive ON, standard.
+        assertEquals(
+            AncStatus(AncMode.ANC, voicePassthrough = false, ambientLevel = 20, noiseAdaptive = 0, adaptiveSensitivity = 0),
+            SonyResponses.parseAnc(SonyDialect.V2, bytes(0x67, 0x19, 0x01, 0x01, 0x00, 0x00, 0x14, 0x00, 0x00)),
+        )
+        val amb = SonyResponses.parseAnc(SonyDialect.V2, bytes(0x69, 0x19, 0x01, 0x01, 0x01, 0x01, 0x05, 0x01, 0x02))
+        assertEquals(AncStatus(AncMode.AMBIENT, voicePassthrough = true, ambientLevel = 5, noiseAdaptive = 1, adaptiveSensitivity = 2), amb)
+        val off = SonyResponses.parseAnc(SonyDialect.V2, bytes(0x67, 0x19, 0x01, 0x00, 0x00, 0x00, 0x14, 0x00, 0x00))
+        assertEquals(AncMode.OFF, off!!.mode)
+        // Out-of-range enum bytes are rejected, as Sony's rf0/g.f does.
+        assertNull(SonyResponses.parseAnc(SonyDialect.V2, bytes(0x67, 0x19, 0x01, 0x01, 0x02, 0x00, 0x14, 0x00, 0x00)))
+        assertNull(SonyResponses.parseAnc(SonyDialect.V2, bytes(0x67, 0x19, 0x01, 0x01, 0x00, 0x00, 0x14, 0x00, 0x03)))
+        assertNull(SonyResponses.parseAnc(SonyDialect.V2, bytes(0x67, 0x17, 0x01, 0x01, 0x00, 0x00, 0x14, 0x00, 0x00)))
+    }
+
+    @Test
     fun parseAncV2RejectsBadLengthOrSub() {
         assertNull(SonyResponses.parseAnc(SonyDialect.V2, bytes(0x67, 0x15, 0x01))) // too short
         assertNull(SonyResponses.parseAnc(SonyDialect.V2, bytes(0x67, 0x99, 0x01, 0x01, 0x01, 0x00, 0x0f))) // bad sub
