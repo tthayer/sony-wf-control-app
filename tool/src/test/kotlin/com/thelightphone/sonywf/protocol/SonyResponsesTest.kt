@@ -220,12 +220,12 @@ class SonyCommandsAndResponsesTest {
         )
         assertContentEquals(bytes(0x68, 0x19, 0x01, 0x01, 0x01, 0x01, 0x0c, 0x00, 0x02), amb)
         val off = SonyCommands.ancSet(SonyDialect.V2, 0x19, wind = false, AncMode.OFF, level = 20, voice = false)
-        assertContentEquals(bytes(0x68, 0x19, 0x01, 0x00, 0x00, 0x00, 0x14, 0x01, 0x00), off)
+        assertContentEquals(bytes(0x68, 0x19, 0x01, 0x00, 0x00, 0x00, 0x14, 0x00, 0x00), off)
     }
 
     @Test
     fun parseAncV2AdaptiveSub19LiveXm6Reply() {
-        // Live WF-1000XM6 GET 66 19 reply: NC on, noise cancelling, level 20, adaptive ON, standard.
+        // Live WF-1000XM6 GET 66 19 reply: NC on, noise cancelling, level 20, Auto Ambient Sound off, standard.
         assertEquals(
             AncStatus(AncMode.ANC, voicePassthrough = false, ambientLevel = 20, noiseAdaptive = 0, adaptiveSensitivity = 0),
             SonyResponses.parseAnc(SonyDialect.V2, bytes(0x67, 0x19, 0x01, 0x01, 0x00, 0x00, 0x14, 0x00, 0x00)),

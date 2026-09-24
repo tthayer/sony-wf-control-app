@@ -218,7 +218,7 @@ object SonyResponses {
     /**
      * Sub 0x19 (`rf0/g.java`): `[2]` value-change status, `[3]` NC/ASM on,
      * `[4]` 0 NC / 1 ASM, `[5]` 0 normal / 1 voice, `[6]` level, `[7]` noise
-     * adaptive (0 on / 1 off), `[8]` sensitivity (0..2). Range checks match
+     * adaptive / Auto Ambient Sound (0 off / 1 on), `[8]` sensitivity (0..2). Range checks match
      * Sony's validator `rf0/g.f`.
      */
     private fun parseAncV2Adaptive(payload: ByteArray): AncStatus? {

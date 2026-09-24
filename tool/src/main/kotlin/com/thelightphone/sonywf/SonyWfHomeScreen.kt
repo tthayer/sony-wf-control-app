@@ -268,6 +268,7 @@ class SonyWfHomeScreen(sealedActivity: SealedLightActivity) :
         is FirmwareUpdateUi.Unknown -> null
         is FirmwareUpdateUi.Checking -> "Checking for updates"
         is FirmwareUpdateUi.UpToDate -> "Up to date"
+        is FirmwareUpdateUi.CheckFailed -> "Can't reach the update server"
         is FirmwareUpdateUi.Unsupported -> update.reason
         is FirmwareUpdateUi.Available -> "Firmware ${update.version} available"
         is FirmwareUpdateUi.Confirming -> "Install firmware ${update.version}?"

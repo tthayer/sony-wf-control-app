@@ -320,7 +320,7 @@ class SonyProtocolClientTest {
                 SonyCommands.V2_BATTERY_TYPE_DUAL to b(0x23, 0x09, 97, 0x00, 99, 0x00),
             ),
             ancSupportedSub = SonyCommands.V2_ANC_SUB_ADAPTIVE, // 0x19
-            // Live XM6 reply: NC on, noise cancelling, level 20, adaptive ON, sensitivity HIGH.
+            // Live XM6 reply: NC on, noise cancelling, level 20, Auto Ambient Sound off, sensitivity HIGH.
             ancReplyPayload = b(0x67, 0x19, 0x01, 0x01, 0x00, 0x00, 0x14, 0x00, 0x01),
         )
         val conn = FakeSonyConnection(device)

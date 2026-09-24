@@ -71,8 +71,12 @@ object SonyCommands {
      */
     const val V2_ANC_SUB_ADAPTIVE = 0x19
 
-    /** NoiseAdaptiveOnOffValue OFF for the 0x19 layout (ON is 0x00). */
-    const val NOISE_ADAPTIVE_OFF = 0x01
+    /**
+     * Auto Ambient Sound (noise adaptive) OFF for the 0x19 layout. Byte [7] is
+     * an NcAsmOnOffValue (OFF 0x00, ON 0x01; `rf0/g.java:26`), not the
+     * NoiseAdaptiveMode enum (ON 0x00) used by Adaptive Sound Control.
+     */
+    const val NOISE_ADAPTIVE_OFF = 0x00
 
     // ---- Firmware ----------------------------------------------------------
 
