@@ -124,7 +124,8 @@ headphones report themselves.
 Specs: [`docs/protocol/fw-update-design.md`](docs/protocol/fw-update-design.md)
 (API contract), [`spec-tandem-fota.md`](docs/protocol/spec-tandem-fota.md)
 (Tandem transfer), [`spec-airoha-mt28xx-single.md`](docs/protocol/spec-airoha-mt28xx-single.md)
-(MTK transfer), [`spec-firmware-download.md`](docs/protocol/spec-firmware-download.md)
+(MTK transfer), [`spec-airoha-mt2833-tws.md`](docs/protocol/spec-airoha-mt2833-tws.md)
+(MTK two-bud transfer, not implemented yet), [`spec-firmware-download.md`](docs/protocol/spec-firmware-download.md)
 (feed discovery/decrypt), [`spec-update-orchestration.md`](docs/protocol/spec-update-orchestration.md)
 (gating).
 

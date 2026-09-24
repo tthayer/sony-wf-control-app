@@ -332,6 +332,9 @@ For **AB1562** the flag never flips: `f7.a.f45836p` is a static `false`
 
 ### 2.2 Relay (agent → partner) wrapper
 
+> **AB1562 only.** The MT2822/MT2833/MT2855 libraries never send 0x0D00/0x0D01; MT2833 TWS
+> addresses the partner by a role byte or a TWS race id (`spec-airoha-mt2833-tws.md` §4).
+
 `libcommon` and the FOTA stages can wrap a command so the agent bud forwards it
 to the partner:
 
@@ -820,6 +823,9 @@ Main flow `d8/d.java:1131-1173` (`p0()`,
 
 ### 3.8 MT2833/MT2855 TWS sequence
 
+> **Superseded for MT2833 TWS** by [`spec-airoha-mt2833-tws.md`](spec-airoha-mt2833-tws.md) (2026-09-24, fresh decompile + live WF-1000XM6 probe); see its §10.2. Not all 19 stages below are sent: a skip graph drops several on every normal run
+(new spec §5–§6).
+
 Pre-flow query (`d8/b.java:502-514`): `h8/f` CheckAgentChannel →
 `h8/h`(0) → `h8/h`(1) GetBattery → `h8/g`(0) → `h8/g`(1) GetVersion →
 `h8/i` TwsQueryState.
@@ -863,8 +869,8 @@ Main flow `d8/d.java:1332-1412` (`y0()`):
 **TWS commit** (`d8/d.java:1287-1298`): `h8/b` `TwsCommit`, **0x1C11**, no
 payload, 15 s timeout.
 **RHO / role switch** (`d8/d.java:1025-1038`): `h8/a`, **0x0CD7**, no payload,
-15 s timeout. Completion arrives as a notify on race **0x0900** with module byte
-`BE16(rx[7], rx[6]) == 20`, result `[8]`, agentChannel `[9]`
+15 s timeout. Completion arrives as a notify on race **0x0900** with module
+**LE16 rx[6..7]** `== 0x0014` (the code's `BE16(rx[7], rx[6])`), result `[8]`, agentChannel `[9]`
 (`d8/d.java:678-694`).
 **Keep-alive ping** (`d8/b.java:211-236`): `h8/c`, **0x1C1B**, payload
 `{0x01, isTws ? 1 : 0}`.
@@ -874,6 +880,10 @@ and a `0x5D` frame (`d8/d.java:645-674`). Reason 0..4 →
 DEVICE_CANCELLED / FOTA_FAIL / TIMEOUT / PartnerLoss / NOT_ALLOWED.
 
 ### 3.9 MT2833/MT2855 — how the partner is addressed
+
+> **Superseded for MT2833 TWS** by [`spec-airoha-mt2833-tws.md`](spec-airoha-mt2833-tws.md) (2026-09-24, fresh decompile + live WF-1000XM6 probe); see its §10.2. In particular the agent does **not** relay the image: the host writes the
+connected bud only, requests a role switch (0x0CD7) only when the agent is at 0x0311, the partner
+is not and the action is StartFota, then writes the other bud in a second pass (new spec §7).
 
 **No relay race id and no flag-byte addressing** — unlike AB1562. The partner is
 selected by a **role byte inside the payload** (`0` = agent, `1` =

@@ -339,7 +339,9 @@ background); `UPDT_RET_PARAM` carries the inq-0x04 trailing auto-update byte (`s
 §3.6). RACE on its own RFCOMM channel: chip name `MT2833_Earbuds`; 0x0CC4 role `0x40` (agent);
 0x0D00 GetAvailableDst `05 06`; 0x1C04 state `0xFFFF`; 0x1C00 partition 0 storage 0 addr
 `0x00928000` len `0x005B7000`; 0x1C07/0x0CD6 answer 0x5B status 0 then a 0x5D with the data
-(`v1.0.0`, 99%). TWS, so v1 refuses it (below).
+(`v1.0.0`, 99%). TWS, so v1 refuses it (below) and does not offer UPDATE. Sony's TWS flow for it
+(two-pass, role switch, no relay) and the live TWS pre-flow replies are in
+`spec-airoha-mt2833-tws.md`; the single-device path here would flash only the connected bud.
 
 Scope v1: single device only (capability `tws == false`), chips MT2822 and MT2833 (mode byte
 Background `0x00` when `UpdateCapability.backgroundTransfer` else Active `0x01`). MT2855 and TWS
