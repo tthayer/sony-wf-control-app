@@ -282,6 +282,17 @@ Offsets are computed by walking the length prefixes (`eg0/q.java:74-88`,
 `eg0/r.java:32-46`; model `ob0/j2.java`). Each prefix must be `>0 && <=128` for the first two and
 `>=0 && <=128` afterwards (`eg0/q.java:19-36`).
 
+**Inquired type 0x04 (`FW_UPDATE_MTK_TRANSFER_WO_DISCONNECTION_AUTO_UPDATE`) has a longer reply.**
+`eg0/q.java` routes 0x02/0x05/0x06/0x07/PART1 to `eg0/r` (layout above, nothing after `uniqueId`) and
+0x04 alone to `eg0/s`, which appends one byte:
+
+```
+    str{128} uniqueId                              s.r()
+    u8 OnOffSettingValue autoUpdate                s.t()   0x00 ON, 0x01 OFF (0xFF OUT_OF_RANGE rejected)
+```
+`eg0/s.java` validation requires the byte to be present and in range. Seen live on WF-1000XM6
+(fw 1.6.0, 2026-09-24): `… 10 "38E6FFAEAA027151" 00`, i.e. auto-update ON.
+
 **PART1 is in the accepted set** for RET_PARAM (`eg0/q.java:11`), so these two battery thresholds are
 the "is the battery high enough" precondition source for Tandem FOTA as well.
 

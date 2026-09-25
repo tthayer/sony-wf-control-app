@@ -268,8 +268,11 @@ class SonyWfViewModel(
                 is UpdateCheck.Available -> {
                     // Tandem over MDR and MTK over Airoha RACE can both be driven
                     // from here; MC_APP has no transport of ours, so it stays check-only.
+                    // MTK is single-device only: TWS earbuds (or no capability reply)
+                    // would be refused by MtkUpdateController, so don't offer UPDATE.
+                    val capability = protocol.updateCapability.value
                     val installable = inputs.method == FirmwareUpdateMethod.TANDEM ||
-                        inputs.method == FirmwareUpdateMethod.MTK
+                        (inputs.method == FirmwareUpdateMethod.MTK && capability != null && !capability.tws)
                     pendingUpdate = result.update
                     pendingInstallable = installable
                     FirmwareUpdateUi.Available(result.update.version, result.update.sizeBytes, installable)

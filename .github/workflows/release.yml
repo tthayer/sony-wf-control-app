@@ -35,6 +35,10 @@ jobs:
 
       - name: Set up Android SDK
         uses: android-actions/setup-android@v3
+        with:
+          # The default also installs the legacy 'tools' package, which newer
+          # cmdline-tools (16.0 on the runners) no longer ship, failing the step.
+          packages: platform-tools
 
       - name: Install Android platform + build-tools
         run: sdkmanager "platform-tools" "platforms;android-36" "build-tools;36.0.0"

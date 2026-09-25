@@ -224,8 +224,10 @@ object UpdtMessages {
 
     /**
      * `UPDT_RET_PARAM` (§3.6): five `str{128}` fields, two battery thresholds,
-     * then a sixth `str{128}`. The inquired type is NOT checked — the reply
-     * shape is identical for every accepted sub-address.
+     * then a sixth `str{128}`. [INQ_MTK_AUTO_UPDATE] replies append one
+     * OnOffSettingValue (auto-update, `0x00` on / `0x01` off; `eg0/s.java`,
+     * seen live on WF-1000XM6); every other inquired type ends at the
+     * `str{128}` (`eg0/r.java`).
      */
     fun parseParam(payload: ByteArray): UpdateParams? {
         if (payload.size < 3) return null
@@ -244,7 +246,13 @@ object UpdtMessages {
         pos += 2
         val uniqueId = readString(payload, pos) ?: return null
         // Trailing bytes would mean we mis-walked the length prefixes.
-        if (uniqueId.second != payload.size) return null
+        val end = if (u8(payload, 1) == INQ_MTK_AUTO_UPDATE) {
+            if (uniqueId.second >= payload.size || u8(payload, uniqueId.second) > 0x01) return null
+            uniqueId.second + 1
+        } else {
+            uniqueId.second
+        }
+        if (end != payload.size) return null
 
         return UpdateParams(
             categoryId = strings[0],

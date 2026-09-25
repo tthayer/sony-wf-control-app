@@ -478,6 +478,10 @@ preconditions from scratch.
   variants).
 
 ### TWS partner bud handling
+
+> **Corrected (2026-09-24):** for MT2833 TWS the inference below is wrong. The library is handed one
+> image but writes only the connected bud, then does a role switch (0x0CD7) and a second pass for the
+> other bud; there is no internal relay. See [`spec-airoha-mt2833-tws.md`](spec-airoha-mt2833-tws.md) §7.
 Both buds are tracked throughout via a live connection-status observer
 (`com.sony.songpal.mdr.j2objc.tandem.features.connectionstatus.b`, exposing
 independent L/`a()` and R/`b()` "connected" booleans, `nu/o.java:513-530,543-545`) and,
