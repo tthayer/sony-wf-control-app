@@ -1,8 +1,8 @@
 [tool]
 id = "com.thelightphone.sonycontrol"
 label = "Sony"
-versionCode = 5
-versionName = "0.3.0"
+versionCode = 6
+versionName = "0.3.1"
 # BLUETOOTH_CONNECT lets the tool enumerate already-paired devices and open an
 # RFCOMM (SPP) socket to the earbuds' Sony service. Pair the earbuds in the
 # system Bluetooth settings first; this tool does not scan/discover, so it does
