@@ -23,11 +23,17 @@ data class SonyBattery(
     )
 }
 
-/** Parsed ANC/ambient status reported by the device. */
+/**
+ * Parsed ANC/ambient status reported by the device. [noiseAdaptive] and
+ * [adaptiveSensitivity] are the raw 0x19-layout bytes (null on other layouts),
+ * kept so a later set can echo them.
+ */
 data class AncStatus(
     val mode: AncMode,
     val voicePassthrough: Boolean,
     val ambientLevel: Int,
+    val noiseAdaptive: Int? = null,
+    val adaptiveSensitivity: Int? = null,
 )
 
 /** A decoded, high-level event produced from a [SonyMessage] for a given dialect. */
@@ -190,6 +196,7 @@ object SonyResponses {
     }
 
     private fun parseAncV2(payload: ByteArray): AncStatus? {
+        if (payload.size == 9) return parseAncV2Adaptive(payload)
         if (payload.size != 7 && payload.size != 8) return null
         val sub = payload[1].toInt() and 0xFF
         if (sub != SonyCommands.V2_ANC_SUB_STANDARD && sub != SonyCommands.V2_ANC_SUB_WIND) return null
@@ -206,6 +213,24 @@ object SonyResponses {
         val voice = (payload[if (includesWind) 6 else 5].toInt() and 0xFF) == 1
         val level = payload[if (includesWind) 7 else 6].toInt() and 0xFF
         return AncStatus(mode, voice, level)
+    }
+
+    /**
+     * Sub 0x19 (`rf0/g.java`): `[2]` value-change status, `[3]` NC/ASM on,
+     * `[4]` 0 NC / 1 ASM, `[5]` 0 normal / 1 voice, `[6]` level, `[7]` noise
+     * adaptive / Auto Ambient Sound (0 off / 1 on), `[8]` sensitivity (0..2). Range checks match
+     * Sony's validator `rf0/g.f`.
+     */
+    private fun parseAncV2Adaptive(payload: ByteArray): AncStatus? {
+        fun u(i: Int) = payload[i].toInt() and 0xFF
+        if (u(1) != SonyCommands.V2_ANC_SUB_ADAPTIVE) return null
+        if (u(3) > 1 || u(4) > 1 || u(5) > 1 || u(7) > 1 || u(8) > 2) return null
+        val mode = when {
+            u(3) == 0 -> AncMode.OFF
+            u(4) == 0 -> AncMode.ANC
+            else -> AncMode.AMBIENT
+        }
+        return AncStatus(mode, u(5) == 1, u(6), noiseAdaptive = u(7), adaptiveSensitivity = u(8))
     }
 
     private fun parseAncV1(payload: ByteArray): AncStatus? {

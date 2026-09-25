@@ -90,6 +90,21 @@ class SonyProtocolClient(
     private val _updateParams = MutableStateFlow<UpdateParams?>(null)
     val updateParams: StateFlow<UpdateParams?> = _updateParams.asStateFlow()
 
+    private val _settings = MutableStateFlow<List<SettingState>>(emptyList())
+    /** Device settings found by [discoverSettings], in display order; empty until then. */
+    val settings: StateFlow<List<SettingState>> = _settings.asStateFlow()
+
+    private val _playback = MutableStateFlow<PlaybackState?>(null)
+    /** Playback controls/volume; null when the device does not advertise them. */
+    val playback: StateFlow<PlaybackState?> = _playback.asStateFlow()
+
+    private val _autoAmbient = MutableStateFlow<Boolean?>(null)
+    /** Auto Ambient Sound (0x19 byte [7]); null unless the device uses the 0x19 layout. */
+    val autoAmbient: StateFlow<Boolean?> = _autoAmbient.asStateFlow()
+
+    private val _canPowerOff = MutableStateFlow(false)
+    val canPowerOff: StateFlow<Boolean> = _canPowerOff.asStateFlow()
+
     private val _notifications = MutableSharedFlow<SonyMessage>(
         replay = 0,
         // A firmware transfer bursts notifications; dropping the oldest keeps the
@@ -108,6 +123,7 @@ class SonyProtocolClient(
 
     private val decoder = SonyFrameDecoder()
     private val sendMutex = Mutex() // enforces strictly-sequential sends
+    private val queryMutex = Mutex() // one pending reply slot, so one query at a time
 
     /** Sequence number to stamp on the next outgoing command. */
     @Volatile
@@ -150,6 +166,13 @@ class SonyProtocolClient(
 
     @Volatile
     private var ancWind: Boolean = false
+
+    /** Last reported 0x19-layout noise-adaptive bytes, echoed by [setAnc]. */
+    @Volatile
+    private var ancNoiseAdaptive: Int = SonyCommands.NOISE_ADAPTIVE_OFF
+
+    @Volatile
+    private var ancAdaptiveSensitivity: Int = 0
 
     // ---- Battery accumulation ----------------------------------------------
     //
@@ -248,14 +271,26 @@ class SonyProtocolClient(
     }
 
     /**
-     * Probe the ANC variant. For V2, try the wind sub-byte (0x17) first and fall
-     * back to the standard sub-byte (0x15); for V1, use sub 0x02. The discovered
+     * Probe the ANC variant. For V2, try the noise-adaptive sub-byte (0x19,
+     * WF-1000XM6), then the wind sub-byte (0x17), then the standard sub-byte
+     * (0x15); for V1, use sub 0x02. The discovered
      * sub-byte + wind flag drive [setAnc]. [ancSupported] flips true whenever a
      * valid ANC reply is observed (handled in the inbound loop).
      */
     private suspend fun discoverAnc(dialect: SonyDialect) {
         when (dialect) {
             SonyDialect.V2 -> {
+                // Only a well-formed 9-byte reply counts: other devices ignore 0x19.
+                val adaptive = query(
+                    SonyCommands.ancGet(dialect, SonyCommands.V2_ANC_SUB_ADAPTIVE),
+                    SonyResponses.ANC_RET,
+                    replySub = SonyCommands.V2_ANC_SUB_ADAPTIVE,
+                )
+                if (adaptive != null && SonyResponses.parseAnc(dialect, adaptive.payload) != null) {
+                    ancSubByte = SonyCommands.V2_ANC_SUB_ADAPTIVE
+                    ancWind = false
+                    return
+                }
                 var reply = query(SonyCommands.ancGet(dialect, SonyCommands.V2_ANC_SUB_WIND), SonyResponses.ANC_RET)
                 if (reply != null) {
                     ancSubByte = SonyCommands.V2_ANC_SUB_WIND
@@ -324,6 +359,113 @@ class SonyProtocolClient(
         )
     }
 
+    // ---- Settings ----------------------------------------------------------
+
+    /**
+     * V2 only: read every [SonySettingsCatalog] setting the device advertises
+     * (capability first where the option list is device-specific), the
+     * general-setting slots, and playback. Separate from [start] so the
+     * controls appear before this finishes; replies also keep arriving as
+     * notifies afterwards and are folded in by the inbound loop.
+     */
+    suspend fun discoverSettings() {
+        if (_dialect.value != SonyDialect.V2) return
+        val fns = _supportFunctions.value ?: return
+        val found = ArrayList<SettingState>()
+        for (setting in SonySettingsCatalog.ALL) {
+            if (setting.function !in fns) continue
+            found.add(readSetting(setting))
+        }
+        for (slot in SonySettingsCatalog.GENERAL_SETTING_SLOTS) {
+            if (slot !in fns) continue
+            val cap = query(SonySettingsCatalog.generalSettingCapabilityGet(slot), 0xd1, replySub = slot)
+            val title = cap?.let { SonySettingsCatalog.generalSettingTitle(it.payload) } ?: continue
+            val setting = SonySettingsCatalog.generalSetting(slot, title) ?: continue
+            found.add(readSetting(setting))
+        }
+        _settings.value = found
+        _canPowerOff.value = SonyPlayback.POWER_OFF_FUNCTION in fns
+
+        if (SonyPlayback.FUNCTION in fns) {
+            val steps = query(SonyPlayback.CAPABILITY_GET, 0xa1, replySub = 0x01)
+                ?.let { SonyPlayback.parseCapability(it.payload) }
+            if (steps != null && steps > 0) {
+                _playback.value = PlaybackState(volumeMax = steps - 1)
+                query(SonyPlayback.VOLUME_GET, 0xa7, replySub = 0x20)
+                query(SonyPlayback.STATUS_GET, 0xa3, replySub = 0x01)
+                query(SonyPlayback.METADATA_GET, 0xa7, replySub = 0x01)
+            }
+        }
+    }
+
+    private suspend fun readSetting(setting: SonySetting): SettingState {
+        var options = setting.options
+        setting.capabilityGet?.let { cap ->
+            val reply = query(cap, (cap[0].toInt() and 0xFF) + 1, replySub = setting.sub)
+            reply?.let { SonySettingsCatalog.optionsFromCapability(setting, it.payload) }
+                ?.takeIf { it.isNotEmpty() }
+                ?.let { options = it }
+        }
+        val reply = query(setting.getPayload(), setting.retOpcode, replySub = setting.sub)
+        return SettingState(setting, options, reply?.let { setting.optionIndex(it.payload, options) })
+    }
+
+    /** Select option [index] of the setting with [key]; reflected once acked. */
+    suspend fun setSetting(key: String, index: Int) {
+        val state = _settings.value.firstOrNull { it.setting.key == key } ?: return
+        val option = state.options.getOrNull(index) ?: return
+        sendCommand(SonyFrame.TYPE_COMMAND1, state.setting.setPayload(option))
+        _settings.value = _settings.value.map { if (it.setting.key == key) it.copy(selected = index) else it }
+    }
+
+    suspend fun playbackControl(command: Int) {
+        if (_playback.value == null) return
+        sendCommand(SonyFrame.TYPE_COMMAND1, SonyPlayback.control(command))
+    }
+
+    /** Step the music volume by [delta], clamped to the device's range. */
+    suspend fun stepVolume(delta: Int) {
+        val p = _playback.value ?: return
+        val current = p.volume ?: return
+        val next = (current + delta).coerceIn(0, p.volumeMax)
+        if (next == current) return
+        sendCommand(SonyFrame.TYPE_COMMAND1, SonyPlayback.volumeSet(next))
+        _playback.value = p.copy(volume = next)
+    }
+
+    /** Turn Auto Ambient Sound on/off, keeping the current mode, voice and level. */
+    suspend fun setAutoAmbient(on: Boolean) {
+        if (_autoAmbient.value == null) return
+        ancNoiseAdaptive = if (on) SonyCommands.NOISE_ADAPTIVE_ON else SonyCommands.NOISE_ADAPTIVE_OFF
+        setAnc(_ancMode.value, _ambientLevel.value, _voicePassthrough.value)
+        _autoAmbient.value = on
+    }
+
+    /** USER_POWER_OFF. The device drops the link without replying. */
+    suspend fun powerOff() {
+        if (!_canPowerOff.value) return
+        sendCommand(SonyFrame.TYPE_COMMAND1, SonyPlayback.POWER_OFF)
+    }
+
+    /** Fold a RET/NTFY for a known setting or playback message into state. */
+    private fun applySettingEvent(payload: ByteArray): Boolean {
+        val list = _settings.value
+        val i = list.indexOfFirst { it.setting.matches(payload) }
+        if (i >= 0) {
+            val state = list[i]
+            val selected = state.setting.optionIndex(payload, state.options) ?: return true
+            if (selected != state.selected) {
+                _settings.value = list.toMutableList().also { it[i] = state.copy(selected = selected) }
+            }
+            return true
+        }
+        val p = _playback.value ?: return false
+        SonyPlayback.parseVolume(payload)?.let { _playback.value = p.copy(volume = it); return true }
+        SonyPlayback.parsePlaying(payload)?.let { _playback.value = p.copy(playing = it); return true }
+        SonyPlayback.parseTrack(payload)?.let { _playback.value = p.copy(track = it); return true }
+        return false
+    }
+
     // ---- Commands ----------------------------------------------------------
 
     /**
@@ -335,7 +477,11 @@ class SonyProtocolClient(
     suspend fun setAnc(mode: AncMode, level: Int, voicePassthrough: Boolean) {
         if (!_ancSupported.value) return
         val dialect = _dialect.value ?: return
-        val payload = SonyCommands.ancSet(dialect, ancSubByte, ancWind, mode, level, voicePassthrough)
+        val payload = SonyCommands.ancSet(
+            dialect, ancSubByte, ancWind, mode, level, voicePassthrough,
+            noiseAdaptive = ancNoiseAdaptive,
+            adaptiveSensitivity = ancAdaptiveSensitivity,
+        )
         sendCommand(SonyFrame.TYPE_COMMAND1, payload)
         _ancMode.value = mode
         _ambientLevel.value = level.coerceIn(0, 20)
@@ -404,12 +550,12 @@ class SonyProtocolClient(
         replyOpcode: Int,
         replySub: Int = -1,
         timeoutMs: Long = REPLY_TIMEOUT_MS,
-    ): SonyMessage? {
+    ): SonyMessage? = queryMutex.withLock {
         val deferred = CompletableDeferred<SonyMessage>()
         pendingQueryOpcode = replyOpcode
         pendingQuerySub = replySub
         pendingQuery = deferred
-        return try {
+        try {
             sendCommand(SonyFrame.TYPE_COMMAND1, payload)
             withTimeoutOrNull(timeoutMs) { deferred.await() }
         } finally {
@@ -486,6 +632,11 @@ class SonyProtocolClient(
                 _ancMode.value = event.status.mode
                 _ambientLevel.value = event.status.ambientLevel
                 _voicePassthrough.value = event.status.voicePassthrough
+                event.status.noiseAdaptive?.let {
+                    ancNoiseAdaptive = it
+                    _autoAmbient.value = it == SonyCommands.NOISE_ADAPTIVE_ON
+                }
+                event.status.adaptiveSensitivity?.let { ancAdaptiveSensitivity = it }
             }
             is SonyEvent.Battery -> {
                 val kind = SonyResponses.batteryReplyKind(dialect, message.payload)
@@ -516,7 +667,7 @@ class SonyProtocolClient(
                 _supportFunctions.value = event.functions
                 _updateMethod.value = FirmwareUpdateMethods.fromSupportFunctions(event.functions)
             }
-            null -> applyUpdtEvent(message)
+            null -> if (!applySettingEvent(message.payload)) applyUpdtEvent(message)
         }
     }
 

@@ -8,6 +8,9 @@ import com.thelightphone.sdk.bluetooth.LightBluetoothException
 import com.thelightphone.sdk.bluetooth.LightBluetoothSerial
 import com.thelightphone.sdk.bluetooth.LightSerialConnection
 import com.thelightphone.sonywf.protocol.AncMode
+import com.thelightphone.sonywf.protocol.PlaybackState
+import com.thelightphone.sonywf.protocol.SettingState
+import com.thelightphone.sonywf.protocol.SonyPlayback
 import com.thelightphone.sonywf.protocol.SonyBattery
 import com.thelightphone.sonywf.protocol.SonyProtocolClient
 import com.thelightphone.sonywf.update.AvailableUpdate
@@ -64,11 +67,26 @@ sealed interface SonyUiState {
         val firmwareVersion: String?,
         val updateMethod: FirmwareUpdateMethod?,
         val update: FirmwareUpdateUi,
+        val extras: DeviceExtras = DeviceExtras(),
     ) : SonyUiState
 
     /** The connection dropped or errored. */
     data class Failed(val message: String) : SonyUiState
 }
+
+/**
+ * Settings page content for [SonyUiState.Connected]: what [SonyProtocolClient.discoverSettings]
+ * found, plus whether that page is showing and whether POWER OFF awaits a second tap.
+ */
+data class DeviceExtras(
+    val settings: List<SettingState> = emptyList(),
+    val playback: PlaybackState? = null,
+    val canPowerOff: Boolean = false,
+    /** Auto Ambient Sound (NC/ASM 0x19 noise adaptive); null when the device has no such field. */
+    val autoAmbient: Boolean? = null,
+    val showingSettings: Boolean = false,
+    val powerOffArmed: Boolean = false,
+)
 
 /** The four inputs the update check needs; see docs/protocol/fw-update-design.md §8. */
 private data class UpdateInputs(
@@ -87,6 +105,9 @@ class SonyWfViewModel(
     val state: StateFlow<SonyUiState> = _state.asStateFlow()
 
     private val _update = MutableStateFlow<FirmwareUpdateUi>(FirmwareUpdateUi.Unknown)
+    private val _showingSettings = MutableStateFlow(false)
+    private val _powerOffArmed = MutableStateFlow(false)
+    private var settingsJob: Job? = null
 
     private var connection: LightSerialConnection? = null
     private var client: SonyProtocolClient? = null
@@ -149,8 +170,10 @@ class SonyWfViewModel(
             try {
                 val paired = bluetooth.pairedDevices()
                 // Sony-named devices first; only fall back to probing others if none match.
+                // Within that, devices with a live audio link go first: each absent
+                // device costs a ~5 s page timeout per service UUID.
                 val sony = paired.filter { isLikelySony(it.name) }
-                val candidates = if (sony.isNotEmpty()) sony else paired
+                val candidates = (if (sony.isNotEmpty()) sony else paired).sortedByDescending { it.connected }
                 for (device in candidates) {
                     for (uuid in listOf(SONY_SERVICE_UUID_V2, SONY_SERVICE_UUID_V1)) {
                         val conn = try {
@@ -173,6 +196,7 @@ class SonyWfViewModel(
                         serviceUuid = uuid
                         mirrorState(protocol, deviceName)
                         startUpdateCheck(protocol)
+                        settingsJob = viewModelScope.launch { runCatching { protocol.discoverSettings() } }
                         return@launch
                     }
                 }
@@ -206,14 +230,26 @@ class SonyWfViewModel(
                 update = FirmwareUpdateUi.Unknown,
             )
         }
+        val deviceSide = combine(
+            protocol.settings,
+            protocol.playback,
+            protocol.canPowerOff,
+            protocol.autoAmbient,
+        ) { settings, playback, canPowerOff, autoAmbient ->
+            DeviceExtras(settings, playback, canPowerOff, autoAmbient)
+        }
+        val extras = combine(deviceSide, _showingSettings, _powerOffArmed) { d, showing, armed ->
+            d.copy(showingSettings = showing, powerOffArmed = armed)
+        }
         mirrorJob = viewModelScope.launch {
             combine(
                 core,
                 protocol.firmwareVersion,
                 protocol.updateMethod,
                 _update,
-            ) { base, firmware, method, update ->
-                base.copy(firmwareVersion = firmware, updateMethod = method, update = update)
+                extras,
+            ) { base, firmware, method, update, extra ->
+                base.copy(firmwareVersion = firmware, updateMethod = method, update = update, extras = extra)
             }.collect { _state.value = it }
         }
     }
@@ -264,7 +300,8 @@ class SonyWfViewModel(
             }
             _update.value = when (result) {
                 is UpdateCheck.UpToDate -> FirmwareUpdateUi.UpToDate
-                is UpdateCheck.Error -> FirmwareUpdateUi.Failed(result.message)
+                // A failed check must not block the controls; it re-runs on the next connect.
+                is UpdateCheck.Error -> FirmwareUpdateUi.CheckFailed(result.message)
                 is UpdateCheck.Available -> {
                     // Tandem over MDR and MTK over Airoha RACE can both be driven
                     // from here; MC_APP has no transport of ours, so it stays check-only.
@@ -640,6 +677,9 @@ class SonyWfViewModel(
     }
 
     private fun teardown() {
+        settingsJob?.cancel(); settingsJob = null
+        _showingSettings.value = false
+        _powerOffArmed.value = false
         mirrorJob?.cancel(); mirrorJob = null
         connectJob?.cancel(); connectJob = null
         checkJob?.cancel(); checkJob = null
@@ -655,7 +695,75 @@ class SonyWfViewModel(
         connection?.close(); connection = null
     }
 
-    override fun onBackPressed(): Boolean = false
+    override fun onBackPressed(): Boolean {
+        if (!_showingSettings.value) return false
+        closeSettings()
+        return true
+    }
+
+    // ---- Settings page -----------------------------------------------------
+
+    fun openSettings() {
+        _powerOffArmed.value = false
+        _showingSettings.value = true
+    }
+
+    fun closeSettings() {
+        _powerOffArmed.value = false
+        _showingSettings.value = false
+    }
+
+    /** Advance the setting with [key] to its next option (wrapping). */
+    fun cycleSetting(key: String) {
+        val protocol = client ?: return
+        val state = protocol.settings.value.firstOrNull { it.setting.key == key } ?: return
+        if (state.options.isEmpty()) return
+        val next = ((state.selected ?: -1) + 1) % state.options.size
+        viewModelScope.launch { runCatching { protocol.setSetting(key, next) } }
+    }
+
+    fun toggleAutoAmbient() {
+        val protocol = client ?: return
+        val on = protocol.autoAmbient.value ?: return
+        viewModelScope.launch { runCatching { protocol.setAutoAmbient(!on) } }
+    }
+
+    fun playPause() {
+        val protocol = client ?: return
+        val playing = protocol.playback.value?.playing == true
+        viewModelScope.launch {
+            runCatching { protocol.playbackControl(if (playing) SonyPlayback.PAUSE else SonyPlayback.PLAY) }
+        }
+    }
+
+    fun nextTrack() = playback(SonyPlayback.NEXT)
+
+    fun previousTrack() = playback(SonyPlayback.PREVIOUS)
+
+    private fun playback(command: Int) {
+        val protocol = client ?: return
+        viewModelScope.launch { runCatching { protocol.playbackControl(command) } }
+    }
+
+    fun volumeUp() = stepVolume(+1)
+
+    fun volumeDown() = stepVolume(-1)
+
+    private fun stepVolume(delta: Int) {
+        val protocol = client ?: return
+        viewModelScope.launch { runCatching { protocol.stepVolume(delta) } }
+    }
+
+    /** First tap arms, second tap powers the headphones off. */
+    fun powerOff() {
+        val protocol = client ?: return
+        if (!_powerOffArmed.value) {
+            _powerOffArmed.value = true
+            return
+        }
+        _powerOffArmed.value = false
+        viewModelScope.launch { runCatching { protocol.powerOff() } }
+    }
 
     private fun isLikelySony(name: String?): Boolean {
         if (name == null) return false

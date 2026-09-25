@@ -13,6 +13,13 @@ sealed interface FirmwareUpdateUi {
 
     data object UpToDate : FirmwareUpdateUi
 
+    /**
+     * The feed check itself failed (no network, DNS, server error). Informational
+     * only: unlike [Failed] it never takes over the bar, so the device controls
+     * stay usable. [message] is the raw cause, kept for logs, not shown.
+     */
+    data class CheckFailed(val message: String) : FirmwareUpdateUi
+
     /** Device cannot be updated from here (e.g. no update support at all). */
     data class Unsupported(val reason: String) : FirmwareUpdateUi
 

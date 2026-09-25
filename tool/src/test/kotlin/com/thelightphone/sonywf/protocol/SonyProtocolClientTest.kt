@@ -311,6 +311,35 @@ class SonyProtocolClientTest {
         client.stop()
     }
 
+    // (b2) WF-1000XM6: ANC on sub 0x19 (9-byte, noise adaptive); reads the real mode.
+    @Test
+    fun v2AdaptiveAncReadsCurrentModeAndEchoesAdaptiveOnSet() = runTest {
+        val device = EmulatedDevice(
+            initReplyLen = 8, // V2
+            batteryReplies = mapOf(
+                SonyCommands.V2_BATTERY_TYPE_DUAL to b(0x23, 0x09, 97, 0x00, 99, 0x00),
+            ),
+            ancSupportedSub = SonyCommands.V2_ANC_SUB_ADAPTIVE, // 0x19
+            // Live XM6 reply: NC on, noise cancelling, level 20, Auto Ambient Sound off, sensitivity HIGH.
+            ancReplyPayload = b(0x67, 0x19, 0x01, 0x01, 0x00, 0x00, 0x14, 0x00, 0x01),
+        )
+        val conn = FakeSonyConnection(device)
+        val client = SonyProtocolClient(conn, backgroundScope)
+
+        client.start()
+        advanceUntilIdle()
+
+        assertTrue(client.ancSupported.value)
+        assertEquals(AncMode.ANC, client.ancMode.value)
+        assertEquals(20, client.ambientLevel.value)
+
+        client.setAnc(AncMode.AMBIENT, level = 20, voicePassthrough = false)
+        advanceUntilIdle()
+        assertContentEquals(b(0x68, 0x19, 0x01, 0x01, 0x01, 0x00, 0x14, 0x00, 0x01), ancSetPayload(conn.writes))
+
+        client.stop()
+    }
+
     // (c) v1 device: INIT reply len 4, battery opcode 0x10, ANC sub 0x02 (non-wind).
     @Test
     fun v1DeviceUsesV1Layout() = runTest {

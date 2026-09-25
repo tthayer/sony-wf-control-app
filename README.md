@@ -100,6 +100,20 @@ Upstream Light SDK has no Bluetooth support, so this repo pins its submodule to
 3. A LightOS-server grant so the dangerous runtime `BLUETOOTH_CONNECT`
    permission is actually granted on-device (mirrors how `CAMERA` is handled).
 
+## Settings
+
+The gear icon opens a settings page listing whatever the connected device
+advertises (discovered from its support-function table, so other models show
+their own subset). On a WF-1000XM6: Auto Ambient Sound, Equalizer preset,
+DSEE, Background Music Effect, Speak-to-Chat, pause when removed, head
+gestures, voice assistant, auto power off, Auto Power Save, connection
+quality, hearing your own voice on calls, multipoint, and power off (tap
+twice). Tap a row to step to its next value. The bottom bar carries volume
+down/up, previous/next and play/pause. Wire specs:
+[`spec-mdr-v2-functions.md`](docs/protocol/spec-mdr-v2-functions.md),
+[`spec-mdr-v2-settings-sound-power.md`](docs/protocol/spec-mdr-v2-settings-sound-power.md),
+[`spec-mdr-v2-settings-system-playback.md`](docs/protocol/spec-mdr-v2-settings-system-playback.md).
+
 ## Firmware updates
 
 The tool checks Sony's firmware feed (`info.update.sony.net`, hence the
